@@ -56,5 +56,30 @@
       "routing": "e32bb3e4b02a1486b8341fdfe9d8aaf1e0b478ee",
       "compaction": "b50733d1a4afe6bb90116afb0ec216cc09576d81"
     }
+  },
+  "routing-v2": {
+    "file": "fx-routing-v2",
+    "sourceCommit": "7293c4842f7ab55d407d51f4165302cee3c6f2b5",
+    "baseCommit": "c5cc64cb5518ef8e92f59e3ce2caf32f13d5f860",
+    "sha256": "df16872cf785a2c42c9e9572c6b4e4db80df875e5426b5f72914c446bb2cc349",
+    "bytes": 12342504,
+    "zigVersion": "0.16.0",
+    "buildCommand": "zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl --prefix zig-out-harbor -j4",
+    "status": "built-clean-source",
+    "notes": "Routing with separated failure telemetry, direct TypeSafe evaluation transport, and size-gated routine routing. Direct TypeSafe requires FX_JEV_TYPESAFE_API_KEY.",
+    "evaluationCredential": "FX_JEV_TYPESAFE_API_KEY",
+    "evaluationTransport": "typesafe"
+  },
+  "sol-fixed": {
+    "file": "fx-main",
+    "sourceCommit": "c5cc64cb5518ef8e92f59e3ce2caf32f13d5f860",
+    "baseCommit": "c5cc64cb5518ef8e92f59e3ce2caf32f13d5f860",
+    "sha256": "7568262975013e450471da27fda1a67025376785835b57fdb57e4d62e61db16c",
+    "bytes": 12286088,
+    "zigVersion": "0.16.0",
+    "buildCommand": "zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl --prefix zig-out-harbor -j4",
+    "status": "built-clean-source",
+    "model": "openai/gpt-5.6-sol",
+    "notes": "Fixed strong-model ceiling arm: same binary as main, different pinned model."
   }
 }

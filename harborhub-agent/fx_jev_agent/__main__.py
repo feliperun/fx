@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import collections
 import hashlib
 import json
 import os
@@ -41,12 +42,23 @@ from acp.schema import (
 )
 
 
-REQUESTED_MODEL = "vercel_ai_gateway/" + POLICY["defaultModel"]
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 BUILDS = json.loads((PACKAGE_ROOT / "config/builds.json").read_text())
 FX_LOG = Path("/logs/agent/fx.json")
 FX_STDERR_LOG = Path("/logs/agent/fx-stderr.log")
 FX_TRACE_LOG = Path("/logs/agent/fx-trace.log")
+
+ROUTING_VARIANTS = {"routing", "both", "routing-v2"}
+
+
+def requested_model(build: dict | None = None) -> str:
+    # A variant may pin a different inference model (e.g. the fixed-sol ceiling
+    # arm). Routing variants still resolve to jev/auto downstream.
+    model = (build or {}).get("model") or POLICY["defaultModel"]
+    return "vercel_ai_gateway/" + model
+
+
+REQUESTED_MODEL = requested_model()
 
 
 def selected_build() -> dict:
@@ -60,14 +72,21 @@ def selected_build() -> dict:
         "FX_EXPERIMENT_X9_EDITOR": "patch_v3" if variant == "patch-retry" else "control",
         "FX_EXPERIMENT_X9_PROVIDER_RETRY": "adaptive_v1" if variant == "patch-retry" else "control",
         "FX_EXPERIMENT_JEV_COMPACTION": "1" if variant in {"compaction", "both"} else "0",
-        "FX_EXPERIMENT_JEV_ROUTING": "1" if variant in {"routing", "both"} else "0",
-        "FX_EXPERIMENT_JEV_SUBAGENT_ROUTING": "1" if variant in {"routing", "both"} else "0",
+        "FX_EXPERIMENT_JEV_ROUTING": "1" if variant in ROUTING_VARIANTS else "0",
+        "FX_EXPERIMENT_JEV_SUBAGENT_ROUTING": "1" if variant in ROUTING_VARIANTS else "0",
     }
     if any(os.environ.get(key, default) != value for key, value in expected.items()
            for default in ["control" if key.startswith("FX_EXPERIMENT_X9_") else "0"]):
         raise ValueError("benchmark_switches_do_not_match_binary")
     if variant == "patch-retry" and os.environ.get("FX_EXPERIMENT_JEV_ROUTING", "0") != "0":
         raise ValueError("patch_retry_arm_must_not_enable_jev_routing")
+    if variant == "routing-v2":
+        # Direct TypeSafe evaluation only; the Gateway allowlist must not gate
+        # this arm, and the v1 gateway evaluation key must not be billed here.
+        if os.environ.get("FX_JEV_TRANSPORT") != "typesafe":
+            raise ValueError("routing_v2_requires_typesafe_transport")
+        if os.environ.get("FX_JEV_GATEWAY_API_KEY"):
+            raise ValueError("routing_v2_must_not_use_gateway_evaluation_key")
     return {**build, "variant": variant}
 
 
@@ -108,12 +127,13 @@ class FxAskAgent(Agent):
 
     @staticmethod
     def _model_option() -> SessionConfigOptionSelect:
+        model = requested_model(selected_build())
         return SessionConfigOptionSelect(
-            current_value=REQUESTED_MODEL,
+            current_value=model,
             options=[
                 SessionConfigSelectOption(
-                    value=REQUESTED_MODEL,
-                    name="Frozen fx baseline via Vercel AI Gateway",
+                    value=model,
+                    name="Frozen fx model via Vercel AI Gateway",
                 )
             ],
             id="model",
@@ -151,7 +171,7 @@ class FxAskAgent(Agent):
     ) -> NewSessionResponse:
         del additional_directories, mcp_servers, kwargs
         session_id = uuid4().hex
-        self._sessions[session_id] = {"cwd": cwd, "model": REQUESTED_MODEL}
+        self._sessions[session_id] = {"cwd": cwd, "model": requested_model(selected_build())}
         return NewSessionResponse(
             session_id=session_id,
             config_options=[self._model_option()],
@@ -168,9 +188,9 @@ class FxAskAgent(Agent):
         session = self._sessions.get(session_id)
         if session is None:
             raise ValueError(f"unknown session: {session_id}")
-        if config_id != "model" or value != REQUESTED_MODEL:
+        if config_id != "model" or value != requested_model(selected_build()):
             raise ValueError(f"unsupported model selection: {config_id}={value}")
-        session["model"] = REQUESTED_MODEL
+        session["model"] = requested_model(selected_build())
         return SetSessionConfigOptionResponse(
             config_options=[self._model_option()]
         )
@@ -288,11 +308,21 @@ class FxAskAgent(Agent):
 
         if not os.environ.get("AI_GATEWAY_API_KEY"):
             raise RuntimeError("Direct Gateway credential missing; do not launch the matrix")
-        if build["variant"] in {"compaction", "routing", "both"}:
+        if build["variant"] == "routing-v2":
+            # Direct TypeSafe evaluation: the dedicated credential must exist or
+            # every routing decision would silently fall back for the whole arm.
+            if not (os.environ.get("FX_JEV_TYPESAFE_API_KEY") or os.environ.get("TYPESAFE_KEY")):
+                raise RuntimeError("typesafe evaluation credential missing; do not launch routing-v2")
+        elif build["variant"] in {"compaction", "routing", "both"}:
             evaluation_key()
+        evaluation_source = None
+        if build["variant"] == "routing-v2":
+            evaluation_source = "FX_JEV_TYPESAFE_API_KEY" if os.environ.get("FX_JEV_TYPESAFE_API_KEY") else "TYPESAFE_KEY"
+        elif build["variant"] in {"compaction", "routing", "both"}:
+            evaluation_source = "FX_JEV_GATEWAY_API_KEY"
         (FX_LOG.parent / "credential-sources.json").write_text(json.dumps({
             "inference": "AI_GATEWAY_API_KEY",
-            "evaluation": "FX_JEV_GATEWAY_API_KEY" if build["variant"] in {"compaction", "routing", "both"} else None,
+            "evaluation": evaluation_source,
         }, indent=2))
         if os.environ.get("FX_JEV_PREFLIGHT") == "1" and not session.get("preflight"):
             boolean_probe = await asyncio.to_thread(evaluate, "The old command completed successfully. The current task needs its exact result.", {
@@ -387,6 +417,9 @@ class FxAskAgent(Agent):
             "routingEnabled": os.environ.get("FX_EXPERIMENT_JEV_ROUTING") == "1",
             "childRoutingEnabled": os.environ.get("FX_EXPERIMENT_JEV_SUBAGENT_ROUTING") == "1",
             "routingPolicy": "jev-assignment-v2",
+            "routingReasons": dict(collections.Counter(r["decision"].get("reason") for r in routes)),
+            "routingTelemetryVersions": sorted({r.get("telemetry") for r in routes if r.get("telemetry")}),
+            "routingTransport": os.environ.get("FX_JEV_TRANSPORT", "gateway"),
             "rootRoutingDecisions": sum(r["origin"] == "root" for r in routes),
             "childRoutingDecisions": sum(r["origin"] == "subagent" for r in routes),
             "routingEvaluations": trace.count("event=jev_route_evaluation "),

@@ -6,7 +6,7 @@ not another reasoning agent or a replacement for fx. Each isolated cloud task
 gets one checksum-verified Linux binary, the same tool permissions and `high`
 reasoning effort. The adapter forwards the task and collects artifacts.
 
-The frozen matrix uses five builds listed in `config/builds.json`:
+The frozen matrix uses the builds listed in `config/builds.json`:
 
 | Arm | Binary | Extra behavior |
 |---|---|---|
@@ -15,6 +15,8 @@ The frozen matrix uses five builds listed in `config/builds.json`:
 | compaction | main + native Jev compaction | compaction enabled |
 | routing | main + native Jev routing | routing at root prompt and child assignment boundaries |
 | both | main + native Jev compaction + routing | both native features |
+| routing-v2 | routing + separated failure telemetry + direct TypeSafe evaluation + size-gated routine routing | routing; requires `FX_JEV_TRANSPORT=typesafe` and `FX_JEV_TYPESAFE_API_KEY`; records per-reason decision counts |
+| sol-fixed | main | pins `openai/gpt-5.6-sol`; the fixed strong-model ceiling arm |
 
 `FX_BENCH_VARIANT` selects a declared build. The adapter rejects switches that do
 not match that build. Main is a clean source snapshot without either native

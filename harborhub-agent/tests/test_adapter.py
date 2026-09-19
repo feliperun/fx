@@ -58,6 +58,30 @@ class AdapterTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'switches'):
                     selected_build()
 
+    def test_routing_v2_requires_typesafe_transport_and_rejects_gateway_key(self):
+        base = {'FX_BENCH_VARIANT':'routing-v2', 'FX_EXPERIMENT_JEV_ROUTING':'1',
+                'FX_EXPERIMENT_JEV_SUBAGENT_ROUTING':'1', 'FX_EXPERIMENT_JEV_COMPACTION':'0'}
+        with patch.dict(os.environ, base, clear=True):
+            with self.assertRaisesRegex(ValueError, 'typesafe_transport'):
+                selected_build()
+        with patch.dict(os.environ, {**base, 'FX_JEV_TRANSPORT':'typesafe'}, clear=True):
+            build = selected_build()
+            self.assertEqual(build['variant'], 'routing-v2')
+            self.assertEqual(build['evaluationTransport'], 'typesafe')
+        with patch.dict(os.environ, {**base, 'FX_JEV_TRANSPORT':'typesafe', 'FX_JEV_GATEWAY_API_KEY':'x'}, clear=True):
+            with self.assertRaisesRegex(ValueError, 'gateway_evaluation_key'):
+                selected_build()
+
+    def test_sol_fixed_pins_strong_model_without_routing(self):
+        from fx_jev_agent.__main__ import requested_model
+        with patch.dict(os.environ, {'FX_BENCH_VARIANT':'sol-fixed'}, clear=True):
+            build = selected_build()
+            self.assertEqual(build['variant'], 'sol-fixed')
+            self.assertEqual(requested_model(build), 'vercel_ai_gateway/openai/gpt-5.6-sol')
+        with patch.dict(os.environ, {'FX_BENCH_VARIANT':'sol-fixed', 'FX_EXPERIMENT_JEV_ROUTING':'1'}, clear=True):
+            with self.assertRaisesRegex(ValueError, 'switches'):
+                selected_build()
+
 
 if __name__ == '__main__':
     unittest.main()
