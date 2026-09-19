@@ -5,6 +5,7 @@ const skill_invocation = @import("../../skills/skill_invocation.zig");
 const builtin = @import("builtin");
 const agent_steps = @import("../../config/agent_steps.zig");
 const jev_routing = @import("jev_routing.zig");
+const jev_capability = @import("jev_capability.zig");
 const model_capabilities = @import("../../config/model_capabilities.zig");
 const model_provider = @import("../../config/model_provider.zig");
 const types = @import("../../shared/types.zig");
@@ -5318,6 +5319,40 @@ fn processQueuedPromptInner(
         agent.routed_model = if (summary_accumulator.jev_model) |key| jev_routing.modelId(key) else null;
     } else {
         agent.routed_model = null;
+    }
+
+    // Shadow capability routing measures Jev's tool/skill suggestions without
+    // changing this turn: no schema loading, no notices, and no failure path.
+    if (jev_capability.shadowEnabled() and job.provider == .gateway) {
+        var capability_history: std.ArrayList(ChatMessage) = .empty;
+        session_runtime.appendActiveContextHistoryChatMessages(arena, &capability_history, job.history, 0) catch {};
+        var capability_objective: []const u8 = job.root_user_intent_context;
+        if (capability_objective.len == 0) for (capability_history.items) |message| {
+            if (message.role == .user) {
+                capability_objective = message.content orelse "";
+                break;
+            }
+        };
+        const capability_candidates = jev_capability.collect(
+            arena,
+            config.skill_catalog.skills,
+            config.initial_dynamic_tools,
+        ) catch &[_]jev_capability.Candidate{};
+        if (capability_candidates.len > 0) {
+            _ = jev_capability.suggest(arena, .{
+                .prompt = job.prompt,
+                .history = capability_history.items,
+                .objective = capability_objective,
+                .role = config.routing_role,
+                .origin = @tagName(config.origin),
+                .candidates = capability_candidates,
+                .shortlist_limit = jev_capability.shortlistLimit(),
+                .api_key = job.api_key,
+                .team = job.gateway_team,
+                .cancel_flag = config.cancel_flag,
+                .trace = finish_trace.ctx,
+            }, deps) catch {};
+        }
     }
 
     debug_trace.eventf("agent", "prompt_start", finish_trace.ctx, "prompt_bytes={d} model={s}", .{ job.prompt.len, job.model });
