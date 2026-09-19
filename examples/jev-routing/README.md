@@ -26,6 +26,16 @@ evaluations can use a separate `FX_JEV_GATEWAY_API_KEY` and optional
 `FX_JEV_GATEWAY_TEAM`, so evaluation billing does not move inference billing.
 The dedicated key never inherits the inference team header.
 
+By default evaluations go through AI Gateway (`typesafe-ai/jev`). Set
+`FX_JEV_TRANSPORT=typesafe` to call the TypeSafe API directly with the pinned
+`jev-1.13.0` model and `FX_JEV_TYPESAFE_API_KEY`. Direct TypeSafe avoids a
+Gateway project or provider allowlist that can deny the evaluation model; a
+denial there is recorded as `policy_rejected`, not as evaluator uncertainty.
+The direct transport never falls back to the Gateway or inference key and
+carries no Gateway team. Its response tokens are read from the snake_case
+`input_tokens`/`output_tokens` fields; the Gateway transport reads the camelCase
+forms.
+
 Jev receives the current assignment, bounded role/objective excerpts and recent
 conversation messages. This includes previous assistant text needed to interpret
 short follow-ups. The packet is limited to 24 KB; assignments over 12 KB fall
@@ -56,11 +66,31 @@ Sessions created with this experiment require a build that understands that meta
 
 Set `FX_TRACE_LOG` and include `quality` in `FX_TRACE_SCOPES` to record one
 `event=jev_route` with JSON decision data per routing boundary: origin, selected
-model, policy, classification probabilities, fallback reason, elapsed time and
-available evaluation token counts. Child trace identity events join the decision
-to child/session/work IDs. Evaluation billing is explicitly incomplete in the
-usage ledger; unknown cost is not zero. CLI JSON reports the selected model and
-normal notices show the decision in interactive output.
+model, policy, telemetry version, classification probabilities and the
+thresholds in force, the reason, elapsed time and available evaluation token
+counts. Child trace identity events join the decision to child/session/work IDs.
+Evaluation billing is explicitly incomplete in the usage ledger; unknown cost is
+not zero. CLI JSON reports the selected model and normal notices show the
+decision in interactive output.
+
+Every decision records exactly one reason, so a transport problem is never
+mistaken for evaluator uncertainty:
+
+`classified`, `uncertain`, `policy_rejected`, `rate_limited`, `server_error`,
+`transport_timeout`, `transport_error`, `malformed_response`,
+`evaluator_unavailable`, `input_too_large`, `candidate_ineligible` or the
+residual `evaluation_failed`. Provider error text and response bodies are never
+recorded; only the class is. `policy_rejected` covers access-policy denials such
+as a team allowlist or an unpermitted provider, `rate_limited` covers quota and
+pacing, and `malformed_response` means a response arrived but did not satisfy the
+answer schema.
+
+`scripts/jev-routing-report.py --root <results-dir>` aggregates recorded
+decisions by reason, model and family, and `--sweep` recomputes the decision at
+alternative family/class probability bars from the recorded probabilities. This
+screens a classifier or threshold change offline against real responses; it
+never lowers a bar on its own. Records without a telemetry version predate the
+taxonomy and are reported as an unclassified legacy failure.
 
 Live benchmark results remain pending. The JavaScript utility below remains
 available for standalone classifier experiments; native fx needs no Node runtime.

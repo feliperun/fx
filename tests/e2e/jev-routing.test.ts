@@ -111,12 +111,45 @@ test("native Jev evaluator failure retains an eligible fallback and records over
     expect(result.output).toBe("FALLBACK_REPLY");
     expect(f.evaluations).toHaveLength(1);
     const trace = readFileSync(f.env.FX_TRACE_LOG, "utf8");
-    expect(trace).toContain('"reason":"evaluation_failed"');
+    expect(trace).toContain('"reason":"policy_rejected"');
     expect(trace).toContain('"billing_complete":false');
     expect(trace).not.toContain("private provider error");
     passed = true;
   } finally { f.close(passed); }
 }, 45_000);
+
+test("native Jev records a distinct reason for every evaluation outcome", async () => {
+  const cases: { label: string; reply: (body: any) => Response }[] = [
+    { label: "policy_rejected", reply: () => new Response("denied by policy", { status: 403 }) },
+    { label: "rate_limited", reply: () => new Response("slow down", { status: 429 }) },
+    { label: "server_error", reply: () => new Response("upstream boom", { status: 503 }) },
+    { label: "malformed_response", reply: () => Response.json({ answers: {} }) },
+    // A full, valid distribution whose routine class sits below the class bar.
+    { label: "uncertain", reply: body => Response.json({ answers: Object.fromEntries(
+      Object.entries(body.questions).map(([key, question]: [string, any]) => {
+        const choice = key === "family" ? "agentic-tool-use" : "routine";
+        const soft = key === "taskClass";
+        return [key, { type: "choice", choice, probabilities: Object.fromEntries(
+          Object.keys(question.criteria).map(label => [label, label === choice ? (soft ? 0.68 : 1) : (soft ? 0.16 : 0)]),
+        ) }];
+      }),
+    ) }) },
+  ];
+  let index = 0;
+  const f = nativeFixture(() => fakeGatewayFinalText("REASON_REPLY"), body => cases[index++].reply(body));
+  let passed = false;
+  try {
+    for (const c of cases) {
+      const result = await f.ask("Implement a small helper.");
+      expect(result.model).toBe(candidates[0]);
+    }
+    const trace = readFileSync(f.env.FX_TRACE_LOG, "utf8");
+    for (const c of cases) expect(trace).toContain('"reason":"' + c.label + '"');
+    // A rejection class is recorded, never the provider's error text.
+    for (const text of ["denied by policy", "slow down", "upstream boom"]) expect(trace).not.toContain(text);
+    passed = true;
+  } finally { f.close(passed); }
+}, 90_000);
 
 test("native Jev resumed uncertainty keeps the last selected eligible model", async () => {
   const f = nativeFixture(() => fakeGatewayFinalText("CONTINUITY_REPLY"), (_, i) => i === 0 ? "demanding" : new Response("unavailable", { status: 503 }));
