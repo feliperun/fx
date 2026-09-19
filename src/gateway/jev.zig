@@ -106,7 +106,10 @@ const Operation = struct {
             .response_writer = &writer,
         });
         // Do not put provider error bodies (which can echo input) into traces.
-        if (result.status != .ok) return statusError(result.status);
+        if (result.status != .ok) {
+            if (self.request.rejection_status) |slot| slot.* = @intFromEnum(result.status);
+            return statusError(result.status);
+        }
         return .{ .body = try self.alloc.dupe(u8, writer.buffered()) };
     }
 };

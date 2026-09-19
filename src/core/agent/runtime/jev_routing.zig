@@ -172,6 +172,8 @@ pub const Decision = struct {
     family_probability: ?f64 = null,
     class_probability: ?f64 = null,
     transport: evaluation.Transport = .gateway,
+    /// Bare HTTP status of a rejected evaluation; never the provider's text.
+    rejection_status: ?u16 = null,
     evaluated: bool = false,
     elapsed_ms: i64 = 0,
     input_tokens: ?u64 = null,
@@ -338,17 +340,22 @@ fn evaluate(alloc: std.mem.Allocator, input: Input, provider: stream.Provider, u
     result.evaluated = true;
     result.transport = transport;
     debug_trace.eventf("quality", "jev_route_evaluation", input.trace, "origin={s}", .{input.origin});
+    var rejection_status: u16 = 0;
     var response = call(provider.context, alloc, .{
         .payload = body,
         .api_key = input.api_key,
         .team = input.team,
         .cancel_flag = input.cancel_flag,
         .transport = transport,
+        .rejection_status = &rejection_status,
     }) catch |err| {
         try observation.fail(.ambiguous_delivery);
         // Cancellation and allocation are control flow, never telemetry classes.
         if (evaluation.classifyFailure(err)) |failure| {
             result.reason = failureReason(failure);
+            if (failure == .policy_rejected or failure == .rate_limited or failure == .server_error) {
+                if (rejection_status != 0) result.rejection_status = rejection_status;
+            }
             return;
         }
         return err;

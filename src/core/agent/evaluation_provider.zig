@@ -27,6 +27,10 @@ pub const Request = struct {
     cancel_flag: *std.atomic.Value(bool),
     deadline: ?std.Io.Clock.Timestamp = null,
     transport: Transport = .gateway,
+    /// When set, a transport writes the bare HTTP status of a rejected request
+    /// here so telemetry can separate a denied credential from a malformed
+    /// request without ever recording provider error text.
+    rejection_status: ?*u16 = null,
 };
 
 pub const Response = struct {
