@@ -69,7 +69,18 @@ const Operation = struct {
             .response_writer = &writer,
         });
         // Do not put provider error bodies (which can echo input) into traces.
-        if (result.status != .ok) return error.EvaluationRequestRejected;
+        // Distinct status classes keep shadow-mode telemetry diagnosable
+        // without exposing the body.
+        if (result.status != .ok) return switch (result.status) {
+            .unauthorized => error.EvaluationUnauthorized,
+            .forbidden => error.EvaluationForbidden,
+            .not_found => error.EvaluationNotFound,
+            .too_many_requests => error.EvaluationRateLimited,
+            else => if (@intFromEnum(result.status) >= 500)
+                error.EvaluationServerError
+            else
+                error.EvaluationRequestRejected,
+        };
         return .{ .body = try self.alloc.dupe(u8, writer.buffered()) };
     }
 };

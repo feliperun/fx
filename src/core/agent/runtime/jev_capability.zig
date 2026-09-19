@@ -150,6 +150,8 @@ pub const Suggestion = struct {
     elapsed_ms: i64 = 0,
     input_tokens: ?u64 = null,
     output_tokens: ?u64 = null,
+    /// Static error name for failed evaluations. Never a provider body.
+    error_name: ?[]const u8 = null,
 };
 
 const Answer = struct { label: []const u8, probability: f64 };
@@ -178,6 +180,7 @@ pub fn suggest(alloc: Allocator, input: Input, deps: anytype) !Suggestion {
         .elapsed_ms = result.elapsed_ms,
         .input_tokens = result.input_tokens,
         .output_tokens = result.output_tokens,
+        .error_name = result.error_name,
         .billing_complete = !result.evaluated,
     }, .{});
     defer alloc.free(json);
@@ -226,6 +229,7 @@ fn evaluate(alloc: Allocator, input: Input, deps: anytype, result: *Suggestion) 
     }) catch |err| {
         try observation.fail(.ambiguous_delivery);
         if (err == error.Cancelled or err == error.OutOfMemory) return err;
+        result.error_name = @errorName(err);
         result.reason = .evaluation_failed;
         return;
     };
