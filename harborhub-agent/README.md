@@ -6,7 +6,7 @@ capability-selection shadow experiment. It preserves the benchmarked
 envelope.
 
 - FX experiment source: branch `experiment/jev-capability`
-- Binary SHA-256: `7200f14e6fe3ec67102e342f356c36c2095be4eef258d08fcea55303ad542e14`
+- Binary SHA-256: `9e69cbd6c27936ae7911f0e126f05057f38b6605a9a82368e38b443199f84b51`
 - Binary target: `x86_64-linux-musl`
 - Optimization profile: `ReleaseSafe`
 - Model: `vercel_ai_gateway/openai/gpt-5.6-sol`

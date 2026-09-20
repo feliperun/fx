@@ -5,7 +5,20 @@ const io_mod = @import("../core/shared/io.zig");
 const secret = @import("../core/auth/secret.zig");
 
 const endpoint = "https://ai-gateway.vercel.sh/v4/ai/evaluation-model";
+/// Direct TypeSafe evaluation, used when the dedicated credential is a
+/// TypeSafe key rather than a Gateway key. Selected with FX_JEV_TYPESAFE=1.
+const typesafe_endpoint = "https://api.typesafe.ai/v1/systemone";
+const typesafe_model = "jev-1.13.0";
 const max_response_bytes = 1024 * 1024;
+
+/// TypeSafe-direct mode is experiment-scoped and must stay consistent with the
+/// payload construction in core/agent/runtime/jev_capability.zig.
+pub fn typesafeDirect() bool {
+    return if (io_mod.getenv("FX_JEV_TYPESAFE")) |value|
+        std.mem.eql(u8, value, "1")
+    else
+        false;
+}
 
 const Credentials = struct {
     api_key: []const u8,
@@ -36,21 +49,24 @@ const Operation = struct {
     pub fn run(self: *@This()) !evaluation.Response {
         var http: std.http.Client = .{ .allocator = self.alloc, .io = io_mod.getIo() };
         defer http.deinit();
+        const direct = typesafeDirect();
         const credentials = try select_credentials(self.request, io_mod.getenv("FX_JEV_GATEWAY_API_KEY"), io_mod.getenv("FX_JEV_GATEWAY_TEAM"));
         const authorization = try std.fmt.allocPrint(self.alloc, "Bearer {s}", .{credentials.api_key});
         defer secret.zeroAndFree(self.alloc, authorization);
         var headers: std.ArrayList(std.http.Header) = .empty;
         defer headers.deinit(self.alloc);
-        try headers.appendSlice(self.alloc, &.{
-            .{ .name = "ai-gateway-protocol-version", .value = "0.0.1" },
-            .{ .name = "ai-evaluation-model-specification-version", .value = "4" },
-            .{ .name = "ai-model-id", .value = "typesafe-ai/jev" },
-        });
-        if (credentials.team) |team| try headers.append(self.alloc, .{ .name = client.vercel_ai_gateway_team_header, .value = team });
+        if (!direct) {
+            try headers.appendSlice(self.alloc, &.{
+                .{ .name = "ai-gateway-protocol-version", .value = "0.0.1" },
+                .{ .name = "ai-evaluation-model-specification-version", .value = "4" },
+                .{ .name = "ai-model-id", .value = "typesafe-ai/jev" },
+            });
+            if (credentials.team) |team| try headers.append(self.alloc, .{ .name = client.vercel_ai_gateway_team_header, .value = team });
+        }
         const buffer = try self.alloc.alloc(u8, max_response_bytes);
         defer self.alloc.free(buffer);
         var writer = std.Io.Writer.fixed(buffer);
-        const url = if (io_mod.getenv("FX_E2E_JEV_URL")) |override| blk: {
+        const url = if (direct) typesafe_endpoint else if (io_mod.getenv("FX_E2E_JEV_URL")) |override| blk: {
             if (!client.isLoopbackHttpUrl(override)) return error.UntrustedEvaluationEndpoint;
             break :blk override;
         } else endpoint;

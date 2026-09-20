@@ -255,8 +255,9 @@ fn parseResponse(alloc: Allocator, body: []const u8, shortlist: []const Candidat
     const root = parsed.value;
     if (root != .object) return error.InvalidAnswer;
     if (root.object.get("usage")) |usage| {
-        result.input_tokens = count(usage, "inputTokens");
-        result.output_tokens = count(usage, "outputTokens");
+        // Gateway reports camelCase; TypeSafe-direct reports snake_case.
+        result.input_tokens = count(usage, "inputTokens") orelse count(usage, "input_tokens");
+        result.output_tokens = count(usage, "outputTokens") orelse count(usage, "output_tokens");
     }
     const answers = root.object.get("answers") orelse return error.InvalidAnswer;
     if (answers != .object) return error.InvalidAnswer;
@@ -343,10 +344,20 @@ fn buildShortlist(alloc: Allocator, input: Input) ![]Candidate {
     return selected;
 }
 
+/// TypeSafe-direct mode is experiment-scoped and must stay consistent with the
+/// transport selection in gateway/jev.zig.
+fn typesafeDirect() bool {
+    return if (io_mod.getenv("FX_JEV_TYPESAFE")) |value|
+        std.mem.eql(u8, value, "1")
+    else
+        false;
+}
+
 fn payload(alloc: Allocator, state: []const u8, shortlist: []const Candidate) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try out.writer.writeAll("{\"state\":");
+    const direct = typesafeDirect();
+    try out.writer.writeAll(if (direct) "{\"model\":\"jev-1.13.0\",\"state\":" else "{\"state\":");
     try std.json.Stringify.value(state, .{}, &out.writer);
     try out.writer.writeAll(",\"questions\":{\"primary\":{\"type\":\"choice\",\"instructions\":\"");
     try out.writer.writeAll(primary_instructions);
@@ -356,7 +367,11 @@ fn payload(alloc: Allocator, state: []const u8, shortlist: []const Candidate) ![
     try out.writer.writeAll(secondary_instructions);
     try out.writer.writeAll("\",\"criteria\":{");
     try writeCriteria(&out.writer, shortlist, false);
-    try out.writer.writeAll("}}},\"providerOptions\":{\"gateway\":{\"zeroDataRetention\":true}}}");
+    if (direct) {
+        try out.writer.writeAll("}}}");
+    } else {
+        try out.writer.writeAll("}}},\"providerOptions\":{\"gateway\":{\"zeroDataRetention\":true}}}");
+    }
     return out.toOwnedSlice();
 }
 
