@@ -59,9 +59,9 @@
   },
   "routing-v2": {
     "file": "fx-routing-v2",
-    "sourceCommit": "b474ebbb64913e2bce4e8b760942f9d05befee0b",
+    "sourceCommit": "bab639975609b6b660e489b64dde8ce7adf0628b",
     "baseCommit": "c5cc64cb5518ef8e92f59e3ce2caf32f13d5f860",
-    "sha256": "84f92ce2d1138e2e9310f2954f087a6679e125b390bd2ae3dbab8999ea664af7",
+    "sha256": "ed544267f9c0138c2a599ef1c6ed565ddbd5c86bd47a622aed7729a7a5eecdea",
     "bytes": 12342632,
     "zigVersion": "0.16.0",
     "buildCommand": "zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl --prefix zig-out-harbor -j4",
