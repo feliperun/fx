@@ -259,8 +259,11 @@ fn payload(alloc: std.mem.Allocator, state: []const u8, taxonomy: Taxonomy, tran
         try out.writer.writeByte(':');
         try std.json.Stringify.value(definition, .{}, &out.writer);
     }
+    // Close criteria, the taskClass question, questions, and the root object.
+    // The Gateway request additionally carries providerOptions before its own
+    // root close.
     if (transport == .typesafe) {
-        try out.writer.writeAll("}}}");
+        try out.writer.writeAll("}}}}");
     } else {
         try out.writer.writeAll("}}},\"providerOptions\":{\"gateway\":{\"zeroDataRetention\":true}}}");
     }
@@ -489,6 +492,28 @@ test "Jev routing eligibility respects empty allowlists and actual context requi
     input.required_context_tokens = 90_000;
     input.images = true;
     try std.testing.expect(!eligible(caps, input, models[0]));
+}
+
+test "Jev evaluation payloads are complete valid JSON for every transport" {
+    const alloc = std.testing.allocator;
+    const taxonomy = try std.json.parseFromSlice(Taxonomy, alloc, @embedFile("jev_taxonomy.json"), .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+    defer taxonomy.deinit();
+    for ([_]evaluation.Transport{ .gateway, .typesafe }) |transport| {
+        const body = try payload(alloc, "CURRENT ASSIGNMENT: work", taxonomy.value, transport);
+        defer alloc.free(body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value == .object);
+        const root = parsed.value.object;
+        try std.testing.expect(root.get("questions") != null);
+        if (transport == .typesafe) {
+            try std.testing.expectEqualStrings("jev-1.13.0", root.get("model").?.string);
+            try std.testing.expect(root.get("providerOptions") == null);
+        } else {
+            try std.testing.expect(root.get("model") == null);
+            try std.testing.expect(root.get("providerOptions") != null);
+        }
+    }
 }
 
 test "Jev routing validates distributions and preserves UTF8 packet boundaries" {
