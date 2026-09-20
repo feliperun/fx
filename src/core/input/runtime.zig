@@ -53,7 +53,7 @@ pub const Runtime = struct {
     /// box. Holds the draft the composer is restored to when the picker closes.
     model_picker_draft: ?composer_stash.State = null,
 
-    pub fn initInto(self: *Runtime) void {
+    pub noinline fn initInto(self: *Runtime) void {
         self.* = undefined;
         inline for (std.meta.fields(Runtime)) |field| {
             if (comptime std.mem.eql(u8, field.name, "picker")) continue;

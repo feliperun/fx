@@ -119,7 +119,7 @@ pub const State = struct {
     file_completion_window_start: usize = 0,
     file_picker_episode_seen: bool = false,
 
-    pub fn initInto(self: *State) void {
+    pub noinline fn initInto(self: *State) void {
         self.* = undefined;
         inline for (std.meta.fields(State)) |field| {
             if (comptime std.mem.eql(u8, field.name, "file_completion")) continue;

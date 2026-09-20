@@ -102,7 +102,7 @@ pub const State = struct {
     prepared: ?Snapshot = null,
     presented: ?Snapshot = null,
 
-    pub fn initInto(self: *State) void {
+    pub noinline fn initInto(self: *State) void {
         self.* = undefined;
         inline for (std.meta.fields(State)) |field| {
             if (comptime std.mem.eql(u8, field.name, "raw_query") or
