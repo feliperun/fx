@@ -217,7 +217,7 @@ fn evaluate(alloc: Allocator, input: Input, deps: anytype, result: *Suggestion) 
         result.reason = .abstained;
         return;
     }
-    const body = try payload(alloc, state, shortlist);
+    const body = try payload(alloc, state, shortlist, typesafeDirect());
     defer alloc.free(body);
     const observation = try session_usage.InvocationObservation.begin(deps.usage);
     result.evaluated = true;
@@ -353,10 +353,9 @@ fn typesafeDirect() bool {
         false;
 }
 
-fn payload(alloc: Allocator, state: []const u8, shortlist: []const Candidate) ![]u8 {
+fn payload(alloc: Allocator, state: []const u8, shortlist: []const Candidate, direct: bool) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    const direct = typesafeDirect();
     try out.writer.writeAll(if (direct) "{\"model\":\"jev-1.13.0\",\"state\":" else "{\"state\":");
     try std.json.Stringify.value(state, .{}, &out.writer);
     try out.writer.writeAll(",\"questions\":{\"primary\":{\"type\":\"choice\",\"instructions\":\"");
@@ -368,7 +367,8 @@ fn payload(alloc: Allocator, state: []const u8, shortlist: []const Candidate) ![
     try out.writer.writeAll("\",\"criteria\":{");
     try writeCriteria(&out.writer, shortlist, false);
     if (direct) {
-        try out.writer.writeAll("}}}");
+        // Close criteria, secondary, questions, and the root object.
+        try out.writer.writeAll("}}}}");
     } else {
         try out.writer.writeAll("}}},\"providerOptions\":{\"gateway\":{\"zeroDataRetention\":true}}}");
     }
@@ -542,7 +542,7 @@ test "jev capability: payload carries candidate ids, reserved labels, and valid 
         .{ .id = "alpha", .kind = .skill, .description = "Alpha." },
         .{ .id = "beta", .kind = .mcp, .description = "Beta." },
     };
-    const body = try payload(alloc, "state", &shortlist);
+    const body = try payload(alloc, "state", &shortlist, false);
     defer alloc.free(body);
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
@@ -551,6 +551,25 @@ test "jev capability: payload carries candidate ids, reserved labels, and valid 
     try std.testing.expect(primary.object.get("criteria").?.object.get("alpha") != null);
     try std.testing.expect(primary.object.get("criteria").?.object.get(reserved_none) != null);
     try std.testing.expect(primary.object.get("criteria").?.object.get(reserved_insufficient) != null);
+}
+
+test "jev capability: direct TypeSafe payload is valid JSON with the pinned model" {
+    const alloc = std.testing.allocator;
+    const shortlist = [_]Candidate{
+        .{ .id = "alpha", .kind = .skill, .description = "Alpha." },
+    };
+    const body = try payload(alloc, "state", &shortlist, true);
+    defer alloc.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const root = parsed.value;
+    try std.testing.expectEqualStrings("jev-1.13.0", root.object.get("model").?.string);
+    try std.testing.expect(root.object.get("providerOptions") == null);
+    try std.testing.expect(root.object.get("questions").?.object.get("primary") != null);
+    try std.testing.expect(root.object.get("questions").?.object.get("secondary") != null);
+    // The secondary question omits insufficient_evidence.
+    const secondary = root.object.get("questions").?.object.get("secondary").?;
+    try std.testing.expect(secondary.object.get("criteria").?.object.get(reserved_insufficient) == null);
 }
 
 test "jev capability: answer validation rejects unknown labels and inconsistent distributions" {

@@ -41,7 +41,7 @@ from acp.schema import (
 
 REQUESTED_MODEL = "vercel_ai_gateway/openai/gpt-5.6-sol"
 FX_BINARY = Path(__file__).resolve().parent.parent / "bin" / "fx"
-FX_BINARY_SHA256 = "9e69cbd6c27936ae7911f0e126f05057f38b6605a9a82368e38b443199f84b51"
+FX_BINARY_SHA256 = "79548df8a05b9e93b8ad0edd676c27e3bc25ef2b113174517bda8643c860b892"
 FX_LOG = Path("/logs/agent/fx.json")
 FX_STDERR_LOG = Path("/logs/agent/fx-stderr.log")
 FX_TRACE_LOG = Path("/logs/agent/fx-trace.log")
