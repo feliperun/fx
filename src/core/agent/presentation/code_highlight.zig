@@ -46,34 +46,38 @@ pub fn highlight(
         return styled.toOwnedSlice(alloc);
     }
 
-    const syntax = profile.syntax();
+    const line_comments = profile.line_comments();
+    const block_comment = profile.block_comment();
+    const quotes = profile.quotes();
+    const operators = profile.operators();
+    const settings = profile.settings;
     var index: usize = 0;
     // Command-position state, used only by command_words profiles (shell):
     // the next word is a command name unless a token says otherwise.
-    var command_position = syntax.command_words;
+    var command_position = settings.command_words;
     while (index < source.len) {
         const byte = source[index];
         if (byte == '\n') {
             try styled.append(alloc, '\n');
-            command_position = syntax.command_words;
+            command_position = settings.command_words;
             index += 1;
             continue;
         }
-        if (blockCommentEnd(source, index, syntax.block_comment)) |end| {
+        if (blockCommentEnd(source, index, block_comment)) |end| {
             try appendStyled(alloc, &styled, palette.comment_style, source[index..end], base);
             command_position = false;
             index = end;
             continue;
         }
-        if (lineCommentEnd(source, index, syntax.line_comments)) |end| {
+        if (lineCommentEnd(source, index, line_comments)) |end| {
             try appendStyled(alloc, &styled, palette.comment_style, source[index..end], base);
             command_position = false;
             index = end;
             continue;
         }
-        if (isQuote(byte, syntax.quotes)) {
+        if (isQuote(byte, quotes)) {
             const end = quotedEnd(source, index);
-            if (byte == '"' and syntax.dollar_vars) {
+            if (byte == '"' and settings.dollar_vars) {
                 try appendDoubleQuoted(alloc, &styled, palette, source[index..end], base);
             } else {
                 try appendStyled(alloc, &styled, palette.string_style, source[index..end], base);
@@ -86,7 +90,7 @@ pub fn highlight(
             const end = numberEnd(source, index);
             // Shell: bare number arguments stay plain (a run id is not a
             // literal); only file descriptors glued to a redirect color.
-            if (syntax.bare_numbers or fdContext(source, index, end)) {
+            if (settings.bare_numbers or fdContext(source, index, end)) {
                 try appendStyled(alloc, &styled, palette.number_style, source[index..end], base);
             } else {
                 try styled.appendSlice(alloc, source[index..end]);
@@ -95,7 +99,7 @@ pub fn highlight(
             index = end;
             continue;
         }
-        if (syntax.dollar_vars and byte == '$') {
+        if (settings.dollar_vars and byte == '$') {
             // Command substitution reopens command position for its contents.
             if (index + 1 < source.len and source[index + 1] == '(') {
                 try appendStyled(alloc, &styled, palette.operator_style, "$(", base);
@@ -110,22 +114,22 @@ pub fn highlight(
                 continue;
             }
         }
-        if (syntax.dollar_vars and byte == '~' and tildeStart(source, index, syntax.operators)) {
+        if (settings.dollar_vars and byte == '~' and tildeStart(source, index, operators)) {
             try appendStyled(alloc, &styled, palette.variable_style, "~", base);
             command_position = false;
             index += 1;
             continue;
         }
-        if (syntax.dash_flags and byte == '-') {
-            if (flagEnd(source, index, syntax.operators)) |end| {
+        if (settings.dash_flags and byte == '-') {
+            if (flagEnd(source, index, operators)) |end| {
                 try appendStyled(alloc, &styled, palette.number_style, source[index..end], base);
                 command_position = false;
                 index = end;
                 continue;
             }
         }
-        if (isOperatorChar(byte, syntax.operators)) {
-            const end = operatorRunEnd(source, index, syntax.operators);
+        if (isOperatorChar(byte, operators)) {
+            const end = operatorRunEnd(source, index, operators);
             const run = source[index..end];
             try appendStyled(alloc, &styled, palette.operator_style, run, base);
             // Redirect targets are paths, not commands; `2>&1`-style runs too.
@@ -134,7 +138,7 @@ pub fn highlight(
             index = end;
             continue;
         }
-        if (syntax.command_words and byte == '`') {
+        if (settings.command_words and byte == '`') {
             // Backticks parse as code; their contents reopen command position.
             try styled.append(alloc, byte);
             command_position = true;
@@ -148,7 +152,7 @@ pub fn highlight(
             // /dev/null keeps "null" plain.
             const after_separator = index > 0 and source[index - 1] == '/';
             var styled_word = false;
-            if (syntax.command_words) {
+            if (settings.command_words) {
                 if (command_position and !after_separator) {
                     // Control keywords read as keywords; other command words
                     // as functions, matching the grammar's scopes.
@@ -159,17 +163,17 @@ pub fn highlight(
                     try appendStyled(alloc, &styled, style, token, base);
                     styled_word = true;
                 }
-            } else if (!after_separator and inList(token, profile.keywords, syntax.keyword_case)) {
+            } else if (!after_separator and inList(token, profile.keywords, settings.keyword_case)) {
                 try appendStyled(alloc, &styled, palette.keyword_style, token, base);
                 styled_word = true;
-            } else if (!after_separator and inList(token, profile.literals, syntax.keyword_case)) {
+            } else if (!after_separator and inList(token, profile.literals, settings.keyword_case)) {
                 try appendStyled(alloc, &styled, palette.number_style, token, base);
                 styled_word = true;
             }
             if (!styled_word) try styled.appendSlice(alloc, token);
             // Control keywords are followed by the command they govern; an
             // ordinary command word is followed by its arguments.
-            if (syntax.command_words) {
+            if (settings.command_words) {
                 command_position = styled_word and command_position and
                     inList(token, &command_prefixes, .sensitive);
             }

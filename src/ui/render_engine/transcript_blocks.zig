@@ -953,7 +953,7 @@ fn renderCodeBlockForTranscriptWithTheme(
     else
         "";
     const styled_code = if (profile) |resolved|
-        if (resolved.renders_diff_lines())
+        if (resolved.settings.diff_lines)
             try code_highlight.highlightDiff(alloc, block.code, theme, ui_render.diff_added_marker_style, ui_render.diff_removed_marker_style)
         else
             try code_highlight.highlight(alloc, block.code, resolved, theme, null)

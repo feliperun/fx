@@ -65,20 +65,34 @@ const Settings = packed struct(u32) {
     diff_lines: bool = false,
     keyword_case: KeywordCase = .sensitive,
     detection: Detection = .none,
-    canonical_alias_index: u3 = 0,
-    _padding: u9 = 0,
+    _padding: u12 = 0,
 };
 
-const Syntax = struct {
-    line_comments: []const []const u8,
-    block_comment: ?BlockComment,
-    quotes: []const u8,
-    operators: []const u8,
-    dollar_vars: bool,
-    dash_flags: bool,
-    command_words: bool,
-    bare_numbers: bool,
-    keyword_case: KeywordCase,
+const line_comment_sets = [_][]const []const u8{
+    &.{},
+    &.{"//"},
+    &.{"#"},
+    &.{"--"},
+    &.{ "//", "#" },
+    &.{ "#", "//" },
+    &.{ "#", ";" },
+};
+
+const block_comments = [_]BlockComment{
+    .{ .start = "/*", .end = "*/" },
+    .{ .start = "<!--", .end = "-->" },
+    .{ .start = "<#", .end = "#>" },
+    .{ .start = "--[[", .end = "]]" },
+    .{ .start = "{-", .end = "-}" },
+};
+
+const quote_sets = [_][]const u8{
+    "",
+    "\"",
+    "\"'",
+    "\"'`",
+    "\"`",
+    "`",
 };
 
 pub const Profile = struct {
@@ -88,52 +102,24 @@ pub const Profile = struct {
     settings: Settings = .{},
 
     pub fn label(self: *const Profile) []const u8 {
-        return self.aliases[self.settings.canonical_alias_index];
+        return self.aliases[0];
     }
 
-    pub fn syntax(self: *const Profile) Syntax {
-        const settings = self.settings;
-        return .{
-            .line_comments = switch (settings.line_comments) {
-                .none => &.{},
-                .slash => &.{"//"},
-                .hash => &.{"#"},
-                .dash => &.{"--"},
-                .slash_hash => &.{ "//", "#" },
-                .hash_slash => &.{ "#", "//" },
-                .hash_semicolon => &.{ "#", ";" },
-            },
-            .block_comment = switch (settings.block_comment) {
-                .none => null,
-                .slash_star => .{ .start = "/*", .end = "*/" },
-                .html => .{ .start = "<!--", .end = "-->" },
-                .powershell => .{ .start = "<#", .end = "#>" },
-                .lua => .{ .start = "--[[", .end = "]]" },
-                .haskell => .{ .start = "{-", .end = "-}" },
-            },
-            .quotes = switch (settings.quotes) {
-                .none => "",
-                .double => "\"",
-                .double_single => "\"'",
-                .shell => "\"'`",
-                .double_backtick => "\"`",
-                .backtick => "`",
-            },
-            .operators = if (settings.shell_operators) "&|;<>*" else "",
-            .dollar_vars = settings.dollar_vars,
-            .dash_flags = settings.dash_flags,
-            .command_words = settings.command_words,
-            .bare_numbers = settings.bare_numbers,
-            .keyword_case = settings.keyword_case,
-        };
+    pub fn line_comments(self: *const Profile) []const []const u8 {
+        return line_comment_sets[@intFromEnum(self.settings.line_comments)];
     }
 
-    fn detection(self: *const Profile) Detection {
-        return self.settings.detection;
+    pub fn block_comment(self: *const Profile) ?BlockComment {
+        const index = @intFromEnum(self.settings.block_comment);
+        return if (index == 0) null else block_comments[index - 1];
     }
 
-    pub fn renders_diff_lines(self: *const Profile) bool {
-        return self.settings.diff_lines;
+    pub fn quotes(self: *const Profile) []const u8 {
+        return quote_sets[@intFromEnum(self.settings.quotes)];
+    }
+
+    pub fn operators(self: *const Profile) []const u8 {
+        return if (self.settings.shell_operators) "&|;<>*" else "";
     }
 };
 
@@ -144,13 +130,12 @@ const profiles = [_]Profile{
         .keywords = &.{ "const", "var", "fn", "pub", "return", "if", "else", "while", "for", "struct", "enum", "union", "try", "catch", "comptime", "defer", "errdefer", "async", "await", "anytype", "void" },
     },
     .{
-        .aliases = &.{ "js", "jsx", "javascript", "ts", "tsx", "typescript" },
+        .aliases = &.{ "ts", "js", "jsx", "javascript", "tsx", "typescript" },
         .settings = .{
             .line_comments = .slash,
             .block_comment = .slash_star,
             .quotes = .shell,
             .detection = .typescript_assertion,
-            .canonical_alias_index = 3,
         },
         .keywords = &.{ "const", "let", "var", "function", "class", "interface", "type", "export", "import", "from", "return", "if", "else", "for", "while", "async", "await", "new", "extends", "implements", "public", "private", "readonly" },
         .literals = &.{ "true", "false", "null", "undefined" },
@@ -372,8 +357,8 @@ const profiles = [_]Profile{
     },
     .{
         // Inline code spans color as strings; prose numbers stay plain.
-        .aliases = &.{ "md", "markdown", "mdx" },
-        .settings = .{ .block_comment = .html, .quotes = .backtick, .bare_numbers = false, .canonical_alias_index = 1 },
+        .aliases = &.{ "markdown", "md", "mdx" },
+        .settings = .{ .block_comment = .html, .quotes = .backtick, .bare_numbers = false },
     },
     .{
         // Explicit opt-out of highlighting; kept byte-identical.
@@ -397,7 +382,7 @@ pub fn resolve(label: []const u8) ?*const Profile {
 
 pub fn infer(alloc: Allocator, source: []const u8) ?*const Profile {
     for (&profiles) |*profile| {
-        if (matchesDetection(alloc, profile.detection(), source)) return profile;
+        if (matchesDetection(alloc, profile.settings.detection, source)) return profile;
     }
     return null;
 }
