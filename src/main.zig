@@ -614,6 +614,7 @@ const App = struct {
         var app = Self{
             .alloc = alloc,
             .auth = undefined,
+            .input_runtime = undefined,
             .usage_dashboard = undefined,
             .session_persistence = undefined,
             .shell = TranscriptRuntime.init(),
@@ -634,6 +635,7 @@ const App = struct {
             app_secret_store,
             auth_mode,
         );
+        app.input_runtime.initInto();
         usage_dashboard_runtime.Runtime.initInto(&app.usage_dashboard, std.heap.c_allocator);
         app_session_runtime.Persistence.initInto(&app.session_persistence);
         if (comptime host_profile.js_host_workspace) {

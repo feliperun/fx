@@ -53,6 +53,15 @@ pub const Runtime = struct {
     /// box. Holds the draft the composer is restored to when the picker closes.
     model_picker_draft: ?composer_stash.State = null,
 
+    pub fn initInto(self: *Runtime) void {
+        self.* = undefined;
+        inline for (std.meta.fields(Runtime)) |field| {
+            if (comptime std.mem.eql(u8, field.name, "picker")) continue;
+            @field(self.*, field.name) = field.defaultValue().?;
+        }
+        self.picker.initInto();
+    }
+
     pub fn deinit(self: *Runtime, alloc: Allocator) void {
         input_reset.resetPendingTextScalarWithTrace(&self.text_scalar, "shutdown");
         self.paste.deinit(alloc);
@@ -194,11 +203,46 @@ pub const Runtime = struct {
 
 test "runtime owns product input state without terminal mechanics" {
     const alloc = std.testing.allocator;
-    var runtime: Runtime = .{};
+    var runtime: Runtime = undefined;
+    runtime.initInto();
     defer runtime.deinit(alloc);
 
     try runtime.insertionState().insertSlice(alloc, "draft", .clear);
     try std.testing.expectEqualStrings("draft", runtime.edit_state.input.items);
     try std.testing.expect(!@hasField(Runtime, "terminal_action_decoder"));
     try std.testing.expect(!@hasField(Runtime, "terminal_cursor_probe"));
+}
+
+test "in-place runtime initialization preserves every defined default" {
+    const expected: Runtime = .{};
+    var actual: Runtime = undefined;
+    actual.initInto();
+
+    inline for (std.meta.fields(Runtime)) |field| {
+        if (comptime std.mem.eql(u8, field.name, "picker")) {
+            inline for (std.meta.fields(picker_state.State)) |picker_field| {
+                if (comptime std.mem.eql(u8, picker_field.name, "file_completion")) {
+                    const FileCompletion = @TypeOf(expected.picker.file_completion);
+                    inline for (std.meta.fields(FileCompletion)) |completion_field| {
+                        if (comptime std.mem.eql(u8, completion_field.name, "raw_query") or
+                            std.mem.eql(u8, completion_field.name, "lookup_query")) continue;
+                        try std.testing.expectEqualDeep(
+                            @field(expected.picker.file_completion, completion_field.name),
+                            @field(actual.picker.file_completion, completion_field.name),
+                        );
+                    }
+                } else {
+                    try std.testing.expectEqualDeep(
+                        @field(expected.picker, picker_field.name),
+                        @field(actual.picker, picker_field.name),
+                    );
+                }
+            }
+        } else {
+            try std.testing.expectEqualDeep(
+                @field(expected, field.name),
+                @field(actual, field.name),
+            );
+        }
+    }
 }
