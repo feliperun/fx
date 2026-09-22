@@ -104,6 +104,84 @@ pub const Operations = struct {
         }
     };
 
+    const FeatureCatalogBuilder = union(feature_catalog.FeatureCatalogKind) {
+        resources: resources_feature.ResourceCatalogBuilder,
+        resource_templates: resources_feature.TemplateCatalogBuilder,
+        prompts: prompts_feature.CatalogBuilder,
+
+        fn init(
+            kind: feature_catalog.FeatureCatalogKind,
+            alloc: Allocator,
+            protocol: resources_feature.Protocol,
+        ) FeatureCatalogBuilder {
+            return switch (kind) {
+                .resources => .{ .resources = resources_feature.ResourceCatalogBuilder.init(alloc, protocol) },
+                .resource_templates => .{ .resource_templates = resources_feature.TemplateCatalogBuilder.init(alloc, protocol) },
+                .prompts => .{ .prompts = prompts_feature.CatalogBuilder.init(alloc, protocol) },
+            };
+        }
+
+        fn deinit(self: *FeatureCatalogBuilder, alloc: Allocator) void {
+            switch (self.*) {
+                .resources => |*builder| builder.deinit(alloc),
+                .resource_templates => |*builder| builder.deinit(alloc),
+                .prompts => |*builder| builder.deinit(alloc),
+            }
+            self.* = undefined;
+        }
+
+        fn appendPage(
+            self: *FeatureCatalogBuilder,
+            alloc: Allocator,
+            response: []const u8,
+            protocol: resources_feature.Protocol,
+            received_at_ms: u64,
+            cursor: *?[]u8,
+        ) !void {
+            switch (self.*) {
+                .resources => |*builder| {
+                    var page = try resources_feature.parseResourcePage(alloc, response, protocol, .{});
+                    defer page.deinit(alloc);
+                    try replaceOwnedCursor(alloc, cursor, page.next_cursor);
+                    try builder.appendPage(alloc, &page, received_at_ms, .{});
+                },
+                .resource_templates => |*builder| {
+                    var page = try resources_feature.parseTemplatePage(alloc, response, protocol, .{});
+                    defer page.deinit(alloc);
+                    try replaceOwnedCursor(alloc, cursor, page.next_cursor);
+                    try builder.appendPage(alloc, &page, received_at_ms, .{});
+                },
+                .prompts => |*builder| {
+                    var page = try prompts_feature.parseListPage(alloc, response, protocol, .{});
+                    defer page.deinit(alloc);
+                    try replaceOwnedCursor(alloc, cursor, page.next_cursor);
+                    try builder.appendPage(alloc, &page, received_at_ms, .{});
+                },
+            }
+        }
+
+        fn finish(
+            self: *FeatureCatalogBuilder,
+            alloc: Allocator,
+            auth_identity: ?catalog_freshness.Digest,
+        ) !FetchedFeatureCatalog {
+            return switch (self.*) {
+                .resources => |*builder| .{ .resources = .{
+                    .catalog = try builder.finish(alloc),
+                    .auth_identity = auth_identity,
+                } },
+                .resource_templates => |*builder| .{ .resource_templates = .{
+                    .catalog = try builder.finish(alloc),
+                    .auth_identity = auth_identity,
+                } },
+                .prompts => |*builder| .{ .prompts = .{
+                    .catalog = try builder.finish(alloc),
+                    .auth_identity = auth_identity,
+                } },
+            };
+        }
+    };
+
     pub fn ensureResourceCatalog(
         self: Operations,
         server: *McpServer,
@@ -469,11 +547,36 @@ pub const Operations = struct {
         cancel_flag: ?*std.atomic.Value(bool),
         access: tool_mcp_runtime.Access,
     ) !FetchedFeatureCatalog {
-        return switch (kind) {
-            .resources => .{ .resources = try fetchResources(self, server, deadline, cancel_flag, access) },
-            .resource_templates => .{ .resource_templates = try fetchResourceTemplates(self, server, deadline, cancel_flag, access) },
-            .prompts => .{ .prompts = try fetchPrompts(self, server, deadline, cancel_flag, access) },
-        };
+        var builder = FeatureCatalogBuilder.init(
+            kind,
+            self.transport.alloc,
+            serverFeatureProtocol(server),
+        );
+        defer builder.deinit(self.transport.alloc);
+        var cursor: ?[]u8 = null;
+        defer if (cursor) |value| self.transport.alloc.free(value);
+        var producing_identity: ?catalog_freshness.Digest = null;
+        while (true) {
+            var exchange = try request_feature_catalog_page(
+                self,
+                server,
+                kind,
+                cursor,
+                deadline,
+                cancel_flag,
+                access,
+            );
+            defer exchange.response.deinit(self.transport.alloc);
+            try acceptPageIdentity(&producing_identity, exchange.response.auth_identity);
+            try builder.appendPage(
+                self.transport.alloc,
+                exchange.response.body,
+                serverFeatureProtocol(server),
+                exchange.received_at_ms,
+                &cursor,
+            );
+            if (cursor == null) return builder.finish(self.transport.alloc, producing_identity);
+        }
     }
 
     fn fetchFeatureCatalogWithAuthRetry(
@@ -507,84 +610,6 @@ pub const Operations = struct {
     const FetchedResources = struct { catalog: resources_feature.ResourceCatalog, auth_identity: ?catalog_freshness.Digest = null };
     const FetchedResourceTemplates = struct { catalog: resources_feature.TemplateCatalog, auth_identity: ?catalog_freshness.Digest = null };
     const FetchedPrompts = struct { catalog: prompts_feature.Catalog, auth_identity: ?catalog_freshness.Digest = null };
-
-    fn fetchResources(self: Operations, server: *McpServer, deadline: std.Io.Clock.Timestamp, cancel_flag: ?*std.atomic.Value(bool), access: tool_mcp_runtime.Access) !FetchedResources {
-        var builder = resources_feature.ResourceCatalogBuilder.init(self.transport.alloc, serverFeatureProtocol(server));
-        defer builder.deinit(self.transport.alloc);
-        var cursor: ?[]u8 = null;
-        defer if (cursor) |value| self.transport.alloc.free(value);
-        var producing_identity: ?catalog_freshness.Digest = null;
-        while (true) {
-            var exchange = try request_feature_catalog_page(
-                self,
-                server,
-                .resources,
-                cursor,
-                deadline,
-                cancel_flag,
-                access,
-            );
-            defer exchange.response.deinit(self.transport.alloc);
-            try acceptPageIdentity(&producing_identity, exchange.response.auth_identity);
-            var page = try resources_feature.parseResourcePage(self.transport.alloc, exchange.response.body, serverFeatureProtocol(server), .{});
-            defer page.deinit(self.transport.alloc);
-            try replaceOwnedCursor(self.transport.alloc, &cursor, page.next_cursor);
-            try builder.appendPage(self.transport.alloc, &page, exchange.received_at_ms, .{});
-            if (cursor == null) return .{ .catalog = try builder.finish(self.transport.alloc), .auth_identity = producing_identity };
-        }
-    }
-
-    fn fetchResourceTemplates(self: Operations, server: *McpServer, deadline: std.Io.Clock.Timestamp, cancel_flag: ?*std.atomic.Value(bool), access: tool_mcp_runtime.Access) !FetchedResourceTemplates {
-        var builder = resources_feature.TemplateCatalogBuilder.init(self.transport.alloc, serverFeatureProtocol(server));
-        defer builder.deinit(self.transport.alloc);
-        var cursor: ?[]u8 = null;
-        defer if (cursor) |value| self.transport.alloc.free(value);
-        var producing_identity: ?catalog_freshness.Digest = null;
-        while (true) {
-            var exchange = try request_feature_catalog_page(
-                self,
-                server,
-                .resource_templates,
-                cursor,
-                deadline,
-                cancel_flag,
-                access,
-            );
-            defer exchange.response.deinit(self.transport.alloc);
-            try acceptPageIdentity(&producing_identity, exchange.response.auth_identity);
-            var page = try resources_feature.parseTemplatePage(self.transport.alloc, exchange.response.body, serverFeatureProtocol(server), .{});
-            defer page.deinit(self.transport.alloc);
-            try replaceOwnedCursor(self.transport.alloc, &cursor, page.next_cursor);
-            try builder.appendPage(self.transport.alloc, &page, exchange.received_at_ms, .{});
-            if (cursor == null) return .{ .catalog = try builder.finish(self.transport.alloc), .auth_identity = producing_identity };
-        }
-    }
-
-    fn fetchPrompts(self: Operations, server: *McpServer, deadline: std.Io.Clock.Timestamp, cancel_flag: ?*std.atomic.Value(bool), access: tool_mcp_runtime.Access) !FetchedPrompts {
-        var builder = prompts_feature.CatalogBuilder.init(self.transport.alloc, serverFeatureProtocol(server));
-        defer builder.deinit(self.transport.alloc);
-        var cursor: ?[]u8 = null;
-        defer if (cursor) |value| self.transport.alloc.free(value);
-        var producing_identity: ?catalog_freshness.Digest = null;
-        while (true) {
-            var exchange = try request_feature_catalog_page(
-                self,
-                server,
-                .prompts,
-                cursor,
-                deadline,
-                cancel_flag,
-                access,
-            );
-            defer exchange.response.deinit(self.transport.alloc);
-            try acceptPageIdentity(&producing_identity, exchange.response.auth_identity);
-            var page = try prompts_feature.parseListPage(self.transport.alloc, exchange.response.body, serverFeatureProtocol(server), .{});
-            defer page.deinit(self.transport.alloc);
-            try replaceOwnedCursor(self.transport.alloc, &cursor, page.next_cursor);
-            try builder.appendPage(self.transport.alloc, &page, exchange.received_at_ms, .{});
-            if (cursor == null) return .{ .catalog = try builder.finish(self.transport.alloc), .auth_identity = producing_identity };
-        }
-    }
 
     fn acceptPageIdentity(producing: *?catalog_freshness.Digest, incoming: ?catalog_freshness.Digest) !void {
         const page = incoming orelse return;
