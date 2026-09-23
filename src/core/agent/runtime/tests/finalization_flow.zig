@@ -39,6 +39,7 @@ const countNeedle = test_support.countNeedle;
 const readTraceFile = test_support.readTraceFile;
 const textContains = test_support.textContains;
 const logIndex = test_support.logIndex;
+const logContains = test_support.logContains;
 const toolCall = test_support.toolCall;
 
 const PostTurnEndFinalizationCapture = struct {
@@ -212,26 +213,37 @@ test "processQueuedPrompt never presents an empty provider completion as a compl
     const reasoning = [_][]const u8{"Checking whether the branch state is final before replying."};
     const call_one = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
     const call_two = [_]ToolCall{toolCall("call_2", "read_file", "{\"path\":\"b\"}")};
-    const empty_stop = FakeCompletion{ .finish_reason = .stop };
-    const empty_other = FakeCompletion{ .finish_reason = .other };
-    const blank_stop = FakeCompletion{ .content = " \n\t", .finish_reason = .stop };
+    const spent: types.Usage = .{ .input_tokens = 1_000, .output_tokens = 7 };
+    const empty_stop = FakeCompletion{ .finish_reason = .stop, .usage = spent };
+    const empty_other = FakeCompletion{ .finish_reason = .other, .usage = spent };
+    const blank_stop = FakeCompletion{ .content = " \n\t", .finish_reason = .stop, .usage = spent };
     // The reported shape: every output token went to hidden reasoning.
     const empty_length = FakeCompletion{
         .reasoning_chunks = &reasoning,
         .finish_reason = .length,
         .usage = .{ .input_tokens = 256_916, .output_tokens = 131_072 },
     };
+    const empty_notice = "The provider returned an empty response";
     const Case = struct {
         name: []const u8,
+        /// Every completion is requested exactly once.
         completions: []const FakeCompletion,
+        disposition: ?types.ProviderCompletionDisposition = null,
+        notice: []const u8 = empty_notice,
     };
-    // Trailing empty completions absorb a bounded retry, so the contract holds
-    // whether the turn retries, pauses, or fails.
     const cases = [_]Case{
+        // The first request plus two bounded retries.
         .{ .name = "stop", .completions = &.{ empty_stop, empty_stop, empty_stop } },
         .{ .name = "other", .completions = &.{ empty_other, empty_other, empty_other } },
         .{ .name = "whitespace stop", .completions = &.{ blank_stop, blank_stop, blank_stop } },
-        .{ .name = "length after hidden reasoning", .completions = &.{ empty_length, empty_length, empty_length } },
+        // A retry would spend the same exhausted output budget again.
+        .{
+            .name = "length after hidden reasoning",
+            .completions = &.{empty_length},
+            .disposition = .length_limited,
+            .notice = "hit its output limit before producing an answer",
+        },
+        // Two silent tool steps, the summary nudge, then the bounded retries.
         .{ .name = "empty after silent-tool continuation", .completions = &.{
             .{ .tool_calls = &call_one },
             .{ .tool_calls = &call_two },
@@ -249,39 +261,119 @@ test "processQueuedPrompt never presents an empty provider completion as a compl
         var hooks = FakeAgentRuntimeDeps.init(alloc);
         defer hooks.deinit();
         var fixture = PromptFixture{};
-        var config = fixture.config();
-        config.max_provider_attempts = 2;
-        // A scheduled auto-retry parks as a lifecycle pause instead of sleeping.
-        var pause_flag = std.atomic.Value(bool).init(false);
-        hooks.pause_on_auto_retry_status = true;
-        hooks.recovery_pause_flag = &pause_flag;
-        config.recovery_pause_flag = &pause_flag;
 
-        const returned_error: ?anyerror = if (runFakePrompt(&gateway, &hooks, config, fixture.job())) |_|
-            null
-        else |err|
-            err;
+        try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
 
+        try std.testing.expectEqual(case.completions.len, gateway.request_bodies.items.len);
+        try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
+        try std.testing.expectEqual(case.disposition, hooks.finalized_disposition);
+        try std.testing.expect(textContains(&hooks, case.notice));
+        try std.testing.expect(std.mem.find(u8, hooks.finish_assistant_text.?, case.notice) != null);
         // fx must never fabricate an answer the provider did not produce.
         try std.testing.expect(!textContains(&hooks, "Done."));
-        for ([_]?[]const u8{ hooks.finish_assistant_text, hooks.history_assistant_text }) |stored| {
-            const text = stored orelse continue;
-            try std.testing.expect(!std.mem.eql(u8, std.mem.trim(u8, text, " \t\r\n"), "Done."));
-        }
-        if (returned_error) |err| {
-            if (err != error.ModelError) return err;
-        } else {
-            const outcome = hooks.finalized_outcome orelse return error.TestExpectedTurnFinalization;
-            try std.testing.expect(outcome != .completed);
-        }
+        // Answerless attempts still spent tokens, so each one is reported.
+        var spent_output: u64 = 0;
+        for (case.completions) |completion| spent_output += completion.usage.output_tokens orelse 0;
+        try std.testing.expectEqual(spent_output, hooks.reported_output_tokens);
     }
 }
 
-fn logContains(hooks: *const FakeAgentRuntimeDeps, needle: []const u8) bool {
-    for (hooks.log.items) |entry| {
-        if (std.mem.find(u8, entry, needle) != null) return true;
-    }
-    return false;
+test "processQueuedPrompt completes with a retained Stop answer when the continuation is empty" {
+    const alloc = std.testing.allocator;
+    var gateway = FakeGateway.init(alloc, &.{
+        .{ .content = "candidate" },
+        .{ .finish_reason = .stop },
+    });
+    defer gateway.deinit();
+    var deps = FakeAgentRuntimeDeps.init(alloc);
+    defer deps.deinit();
+    var fixture = PromptFixture{};
+    var lifecycle_runtime = lifecycle_hooks.Runtime.init(alloc);
+    defer lifecycle_runtime.deinit();
+    var handler = StopTestHandler{
+        .alloc = alloc,
+        .action = .{ .continue_once = "verify the answer" },
+    };
+    defer handler.deinit();
+    const view = try registerStopTestHandler(&lifecycle_runtime, &handler);
+
+    try runFakePromptWithLifecycle(
+        &gateway,
+        &deps,
+        fixture.config(),
+        fixture.job(),
+        testLifecycleContext(view, alloc, fixture.workspace_root),
+    );
+
+    // The retained answer settles the turn, so the silence is not retried.
+    try std.testing.expectEqual(@as(usize, 1), handler.calls);
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, deps.finalized_outcome.?);
+    try std.testing.expectEqualStrings("candidate", deps.finish_presentation_text.?);
+    try std.testing.expect(!logContains(&deps, "empty response"));
+    try std.testing.expect(!textContains(&deps, "Done."));
+
+    var follow_gateway = FakeGateway.init(alloc, &.{.{ .content = "follow-up" }});
+    defer follow_gateway.deinit();
+    var follow_deps = FakeAgentRuntimeDeps.init(alloc);
+    defer follow_deps.deinit();
+    var follow_fixture = PromptFixture{};
+    var follow_job = follow_fixture.job();
+    follow_job.history = deps.history_turns.items;
+    try runFakePrompt(&follow_gateway, &follow_deps, follow_fixture.config(), follow_job);
+    try expectBodyContains(&follow_gateway, 0, "candidate");
+    try expectBodyNotContains(&follow_gateway, 0, "\"content\":[]");
+}
+
+test "processQueuedPrompt waits for a pending subagent instead of retrying an empty completion" {
+    const alloc = std.testing.allocator;
+    var gateway = FakeGateway.init(alloc, &.{
+        .{ .finish_reason = .stop },
+        .{ .content = "Answer with the subagent result" },
+    });
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.pending_subagent_results = 1;
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 0), hooks.pending_subagent_results);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+    try std.testing.expectEqualStrings("Answer with the subagent result", hooks.finish_assistant_text.?);
+    try std.testing.expect(!logContains(&hooks, "empty response"));
+    // The answerless step adds no empty assistant message to the next request.
+    try expectBodyNotContains(&gateway, 1, "\"content\":[]");
+}
+
+test "processQueuedPrompt hands exhausted empty completions to pending steering" {
+    const alloc = std.testing.allocator;
+    const empty_stop = FakeCompletion{ .finish_reason = .stop };
+    var gateway = FakeGateway.init(alloc, &.{
+        empty_stop,
+        empty_stop,
+        empty_stop,
+        .{ .content = "Steered answer" },
+    });
+    defer gateway.deinit();
+    const steering = [_][]const u8{"narrow the scope"};
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    // Step-top boundary is take 1; the answerless terminal boundary is take 2.
+    hooks.steering_messages = &steering;
+    hooks.steering_take_at = 2;
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 4), gateway.request_bodies.items.len);
+    try expectBodyContainsInOrder(&gateway, 3, &.{ "user_steering", "narrow the scope" });
+    try expectBodyNotContains(&gateway, 3, "\"content\":[]");
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+    try std.testing.expectEqualStrings("Steered answer", hooks.finish_assistant_text.?);
+    try std.testing.expect(!textContains(&hooks, "The provider returned an empty response"));
 }
 
 test "processQueuedPrompt retries an empty provider completion and presents the recovered answer" {

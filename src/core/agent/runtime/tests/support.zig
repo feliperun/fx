@@ -705,6 +705,11 @@ pub const FakeAgentRuntimeDeps = struct {
     immediate_steering_messages: []const []const u8 = &.{},
     immediate_steering_cancel_flag: ?*std.atomic.Value(bool) = null,
     immediate_steering_take_count: usize = 0,
+    /// Yielded subagent results each consumed by one parent wait.
+    pending_subagent_results: usize = 0,
+    subagent_waits: usize = 0,
+    usage_reports: usize = 0,
+    reported_output_tokens: u64 = 0,
 
     pub fn init(alloc: Allocator) FakeAgentRuntimeDeps {
         return .{ .alloc = alloc };
@@ -838,9 +843,31 @@ pub const FakeAgentRuntimeDeps = struct {
             .record_tool_call_rejected = recordRejected,
             .record_tool_call_failed = recordFailed,
             .report_inner_tool_usage = reportCapturedInnerToolUsage,
+            .report_usage = reportUsage,
+            .wait_for_subagent = if (self.pending_subagent_results > 0) waitForSubagent else null,
+            .has_pending_subagent = if (self.pending_subagent_results > 0) hasPendingSubagent else null,
             .usage = self.usage,
             .usage_allocator = self.alloc,
         };
+    }
+
+    fn reportUsage(raw: *anyopaque, usage: types.Usage) void {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        self.usage_reports += 1;
+        self.reported_output_tokens += usage.output_tokens orelse 0;
+    }
+
+    fn hasPendingSubagent(raw: *anyopaque) bool {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        return self.pending_subagent_results > 0;
+    }
+
+    fn waitForSubagent(raw: *anyopaque, _: u64, _: u64) !bool {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        self.subagent_waits += 1;
+        if (self.pending_subagent_results == 0) return false;
+        self.pending_subagent_results -= 1;
+        return true;
     }
 
     fn clearRecoveryCheckpoint(raw: *anyopaque) !void {
@@ -2226,6 +2253,13 @@ pub fn readTraceFile(alloc: Allocator, trace_path: []const u8, max_bytes: usize)
 pub fn textContains(hooks: *const FakeAgentRuntimeDeps, needle: []const u8) bool {
     for (hooks.texts.items) |text| {
         if (std.mem.find(u8, text, needle) != null) return true;
+    }
+    return false;
+}
+
+pub fn logContains(hooks: *const FakeAgentRuntimeDeps, needle: []const u8) bool {
+    for (hooks.log.items) |entry| {
+        if (std.mem.find(u8, entry, needle) != null) return true;
     }
     return false;
 }
