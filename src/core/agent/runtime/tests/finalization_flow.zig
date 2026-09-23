@@ -354,6 +354,28 @@ test "processQueuedPrompt waits for a running subagent instead of retrying an em
     try expectBodyNotContains(&gateway, 1, "\"content\":[]");
 }
 
+test "processQueuedPrompt clears a recovery status before waiting on a subagent" {
+    const alloc = std.testing.allocator;
+    var gateway = FakeGateway.init(alloc, &.{
+        .{ .status = .service_unavailable },
+        .{ .finish_reason = .stop },
+        .{ .content = "Answer after the wait" },
+    });
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.pending_subagent_results = 1;
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    // The wait can block for the whole child run, so the retry status is gone first.
+    try std.testing.expect(hooks.route_recovery_clears_at_subagent_wait.? > 0);
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+    try std.testing.expectEqualStrings("Answer after the wait", hooks.finish_assistant_text.?);
+}
+
 test "processQueuedPrompt retries an empty completion on the last step despite a running subagent" {
     const alloc = std.testing.allocator;
     var gateway = FakeGateway.init(alloc, &.{

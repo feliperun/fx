@@ -4531,7 +4531,10 @@ fn emptyCompletionContinuationPending(
     can_continue: bool,
 ) bool {
     if (stop_state.retained_candidate != null) return true;
-    if (!can_continue) return false;
+    return can_continue and subagentResultOwed(deps);
+}
+
+fn subagentResultOwed(deps: *const AgentRuntimeDeps) bool {
     const pending = deps.has_pending_subagent orelse return false;
     return pending(deps.ctx);
 }
@@ -7066,7 +7069,6 @@ fn processQueuedPromptLoop(
     defer interrupted_persisted_ptr.* = interrupted_persisted;
     var silent_tool_steps: usize = 0;
     var continuation_injected = false;
-    var empty_completion_retries: usize = 0;
     var last_step_ctx = finish_trace.ctx;
     var current_step_index: usize = 0;
     var last_tool_call_name: []const u8 = "none";
@@ -7286,6 +7288,9 @@ fn processQueuedPromptLoop(
         var context_overflow_recovery: ContextOverflowRecoveryState = .ready;
         var recovery_has_unexecuted_tool_start = false;
         var successful_recovery_strategy: ?model_response_recovery.Strategy = null;
+        // Empty retries happen within one step, so every step, including one
+        // continued by steering or a subagent result, gets its own budget.
+        var empty_completion_retries: usize = 0;
         defer {
             if (recovery_has_unexecuted_tool_start and finalization.outcome != .paused) {
                 settle_deferred_tool_starts(deps, &stream_ctx, arena, turn_id, config.cancel_flag);
@@ -9431,7 +9436,6 @@ fn processQueuedPromptLoop(
         });
         // `.retry` here means no retry was scheduled for this completion.
         const answerless = empty_action == .retry or empty_action == .finish;
-        if (empty_action == .none) empty_completion_retries = 0;
         const finish_reason = completion.finish_reason.?;
         if (successful_recovery_strategy != null and !answerless) {
             try pushAutoRecoveredStatus(deps, semantic_attempt, semantic_limit);
@@ -9464,15 +9468,21 @@ fn processQueuedPromptLoop(
                     config.origin,
                     if (!lifecycle.view.hasStop() or stop_state.dispatched) .finalizing else .model,
                 )) break :settlement .steering;
-                if (can_continue_turn and disposition == .completed and try continue_pending_subagent(
-                    deps,
-                    arena,
-                    &within_turn_suffix,
-                    turn_id,
-                    step_ctx.step_id,
-                    "",
-                    reasoning_replay,
-                )) break :settlement .subagent;
+                if (can_continue_turn and disposition == .completed) {
+                    // The subagent wait can block, so no retry status may linger.
+                    if (subagentResultOwed(deps)) {
+                        try clearAutoRetryStatusIfNeeded(deps, successful_recovery_strategy != null);
+                    }
+                    if (try continue_pending_subagent(
+                        deps,
+                        arena,
+                        &within_turn_suffix,
+                        turn_id,
+                        step_ctx.step_id,
+                        "",
+                        reasoning_replay,
+                    )) break :settlement .subagent;
+                }
                 break :settlement if (stop_state.retained_candidate != null) .retained else .fail;
             };
             debug_trace.eventf("agent", "empty_provider_completion", step_ctx, "action={s} finish_reason={s} retries_used={d} streamed_bytes={d}", .{
@@ -9482,12 +9492,11 @@ fn processQueuedPromptLoop(
                 stream_ctx.streamed_output_bytes,
             });
             switch (settlement) {
-                .steering, .subagent => {
-                    // The continued request is new work with its own retries.
-                    empty_completion_retries = 0;
+                .steering => {
                     try clearAutoRetryStatusIfNeeded(deps, successful_recovery_strategy != null);
                     continue;
                 },
+                .subagent => continue,
                 .retained => {
                     try clearAutoRetryStatusIfNeeded(deps, successful_recovery_strategy != null);
                     stop_state.terminal_materializing = true;

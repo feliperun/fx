@@ -712,6 +712,7 @@ pub const FakeAgentRuntimeDeps = struct {
     /// a wait only makes the result ready; its delivery acknowledgement clears it.
     pending_subagent_results: usize = 0,
     subagent_result_ready: bool = false,
+    route_recovery_clears_at_subagent_wait: ?usize = null,
     reported_output_tokens: u64 = 0,
 
     pub fn init(alloc: Allocator) FakeAgentRuntimeDeps {
@@ -867,6 +868,7 @@ pub const FakeAgentRuntimeDeps = struct {
     fn waitForSubagent(raw: *anyopaque, _: u64, _: u64) !bool {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         if (self.pending_subagent_results == 0) return false;
+        self.route_recovery_clears_at_subagent_wait = self.route_recovery_clear_count;
         self.subagent_result_ready = true;
         return true;
     }
