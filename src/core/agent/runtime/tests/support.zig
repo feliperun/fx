@@ -499,7 +499,7 @@ fn captureReviewAuthority(
 }
 
 /// Parent-turn context delivered once a waited-for fake subagent result is ready.
-pub const fake_subagent_result_context = "Subagent results: SUBAGENT_RESULT_OK";
+const fake_subagent_result_context = "Subagent results: SUBAGENT_RESULT_OK";
 
 pub const FakeAgentRuntimeDeps = struct {
     alloc: Allocator,
