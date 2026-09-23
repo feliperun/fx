@@ -4476,6 +4476,103 @@ fn recoveryPauseRequested(config: Config) bool {
     return flag.load(.seq_cst);
 }
 
+/// Consecutive empty completions retried before the turn fails visibly.
+const max_empty_completion_retries: usize = 2;
+const empty_completion_diagnostic = "empty response";
+const empty_completion_notice =
+    "The provider returned an empty response, so there is no answer to show. Retry the request, or switch models if this keeps happening.";
+const empty_length_completion_notice =
+    "The provider hit its output limit before producing an answer. Retry with lower reasoning effort or a narrower request.";
+
+/// Next step for a settled completion that may carry no answer.
+const EmptyCompletionAction = enum {
+    /// Visible text or tool calls: handle the completion normally.
+    none,
+    /// Ask once for a summary of silent tool work.
+    nudge,
+    /// Retry the same request through model-response recovery.
+    retry,
+    /// End the turn with a notice; fx never invents an answer.
+    fail,
+};
+
+const EmptyCompletionEvidence = struct {
+    disposition: types.ProviderCompletionDisposition,
+    tool_call_count: usize,
+    assistant_text: []const u8,
+    nudge_available: bool,
+    retries_used: usize,
+};
+
+/// Pure policy for completions without visible text or tool calls. The
+/// caller owns every effect: retrying, nudging, or finalizing the turn.
+fn emptyCompletionAction(evidence: EmptyCompletionEvidence) EmptyCompletionAction {
+    if (evidence.tool_call_count > 0) return .none;
+    if (std.mem.trim(u8, evidence.assistant_text, " \t\r\n").len > 0) return .none;
+    return switch (evidence.disposition) {
+        .completed => if (evidence.nudge_available)
+            .nudge
+        else if (evidence.retries_used < max_empty_completion_retries)
+            .retry
+        else
+            .fail,
+        // A retry would spend the same exhausted output budget again.
+        .length_limited => .fail,
+        .interrupted, .provider_failure, .invalid_completion => .none,
+    };
+}
+
+test "emptyCompletionAction retries, nudges, or fails only answerless completions" {
+    const base: EmptyCompletionEvidence = .{
+        .disposition = .completed,
+        .tool_call_count = 0,
+        .assistant_text = "",
+        .nudge_available = false,
+        .retries_used = 0,
+    };
+    try std.testing.expectEqual(EmptyCompletionAction.retry, emptyCompletionAction(base));
+
+    var blank = base;
+    blank.assistant_text = " \n\t";
+    try std.testing.expectEqual(EmptyCompletionAction.retry, emptyCompletionAction(blank));
+
+    var answered = base;
+    answered.assistant_text = "answer";
+    try std.testing.expectEqual(EmptyCompletionAction.none, emptyCompletionAction(answered));
+
+    var tools = base;
+    tools.tool_call_count = 1;
+    try std.testing.expectEqual(EmptyCompletionAction.none, emptyCompletionAction(tools));
+
+    var nudge = base;
+    nudge.nudge_available = true;
+    nudge.retries_used = max_empty_completion_retries;
+    try std.testing.expectEqual(EmptyCompletionAction.nudge, emptyCompletionAction(nudge));
+
+    var last_retry = base;
+    last_retry.retries_used = max_empty_completion_retries - 1;
+    try std.testing.expectEqual(EmptyCompletionAction.retry, emptyCompletionAction(last_retry));
+
+    var exhausted = base;
+    exhausted.retries_used = max_empty_completion_retries;
+    try std.testing.expectEqual(EmptyCompletionAction.fail, emptyCompletionAction(exhausted));
+
+    var length = base;
+    length.disposition = .length_limited;
+    length.nudge_available = true;
+    try std.testing.expectEqual(EmptyCompletionAction.fail, emptyCompletionAction(length));
+
+    var truncated_answer = length;
+    truncated_answer.assistant_text = "partial";
+    try std.testing.expectEqual(EmptyCompletionAction.none, emptyCompletionAction(truncated_answer));
+
+    for ([_]types.ProviderCompletionDisposition{ .interrupted, .provider_failure, .invalid_completion }) |disposition| {
+        var owned_elsewhere = base;
+        owned_elsewhere.disposition = disposition;
+        try std.testing.expectEqual(EmptyCompletionAction.none, emptyCompletionAction(owned_elsewhere));
+    }
+}
+
 fn providerFailureReplaySafe(
     completion: types.ModelCompletion,
     stream_ctx: *const runtime_assistant_stream.StreamChunkContext,
@@ -6929,6 +7026,7 @@ fn processQueuedPromptLoop(
     defer interrupted_persisted_ptr.* = interrupted_persisted;
     var silent_tool_steps: usize = 0;
     var continuation_injected = false;
+    var empty_completion_retries: usize = 0;
     var last_step_ctx = finish_trace.ctx;
     var current_step_index: usize = 0;
     var last_tool_call_name: []const u8 = "none";
@@ -8722,13 +8820,25 @@ fn processQueuedPromptLoop(
                 try copyLatestStopPartial(arena, stop_state, partial_assistant);
             }
 
+            // An answerless completion is a provider failure, not an answer.
+            const empty_retry = streamSucceeded(stream_result) and
+                emptyCompletionAction(.{
+                    .disposition = attempt_disposition,
+                    .tool_call_count = attempt_completion.tool_calls.len,
+                    .assistant_text = partial_assistant,
+                    .nudge_available = !continuation_injected and silent_tool_steps >= 2,
+                    .retries_used = empty_completion_retries,
+                }) == .retry;
             var attempt_failure_diagnostic: ?types.ModelFailureDiagnostic = null;
             if (streamSucceeded(stream_result) and
                 (attempt_disposition == .interrupted or
-                    attempt_disposition == .provider_failure))
+                    attempt_disposition == .provider_failure or
+                    empty_retry))
             {
                 const finish_reason = attempt_completion.finish_reason;
-                const cause: model_response_recovery.FailureCause = if (attempt_completion.provider_failure_cause == .gateway_stream_timeout)
+                const cause: model_response_recovery.FailureCause = if (empty_retry)
+                    .provider_unavailable
+                else if (attempt_completion.provider_failure_cause == .gateway_stream_timeout)
                     .provider_stream_timeout
                 else if (attempt_completion.provider_failure_cause == .rate_limited)
                     .rate_limited
@@ -8738,13 +8848,23 @@ fn processQueuedPromptLoop(
                     .content_filter
                 else
                     .provider_unavailable;
-                const diagnostic = try providerCompletionDiagnostic(
-                    arena,
-                    attempt_completion,
-                    defaultRecoveryDiagnosticText(cause),
-                );
+                const diagnostic = if (empty_retry)
+                    types.ModelFailureDiagnostic.init(empty_completion_diagnostic)
+                else
+                    try providerCompletionDiagnostic(
+                        arena,
+                        attempt_completion,
+                        defaultRecoveryDiagnosticText(cause),
+                    );
                 attempt_failure_diagnostic = diagnostic;
                 latest_recovery_diagnostic = diagnostic;
+                if (empty_retry) {
+                    debug_trace.eventf("agent", "empty_provider_completion", step_ctx, "action=retry finish_reason={s} retries_used={d} streamed_bytes={d}", .{
+                        finish_reason.?.label(),
+                        empty_completion_retries,
+                        stream_ctx.streamed_output_bytes,
+                    });
+                }
                 const non_retryable = attempt_completion.provider_failure_cause == .non_retryable;
                 // Interrupted streams and provider-error completions carry
                 // progress evidence; bare HTTP status failures (5xx, 429) and
@@ -8769,7 +8889,8 @@ fn processQueuedPromptLoop(
                         .delivery = .possibly_sent,
                         .attempts = .{ .consumed = semantic_attempt + 1, .limit = semantic_limit },
                         .pacing = retry_pacing,
-                        .output = if (partial_assistant.len > 0) .partial else .none,
+                        // Whitespace from an empty completion is not output to continue.
+                        .output = if (!empty_retry and partial_assistant.len > 0) .partial else .none,
                         .tool = effectiveRecoveryToolEvidence(
                             preserved_tool_evidence,
                             attempt_completion,
@@ -8783,6 +8904,7 @@ fn processQueuedPromptLoop(
                         .recovery_elapsed_ns = recoveryElapsedNs(recovery_started_at_ms),
                     });
                 if (attempt_disposition == .provider_failure or
+                    empty_retry or
                     attempt_completion.provider_failure_cause == .gateway_stream_timeout)
                 {
                     traceRouteFailure(
@@ -8909,6 +9031,7 @@ fn processQueuedPromptLoop(
                         // Probes and connectivity waits are not provider
                         // attempts: nothing billable was sent.
                         if (decision.reserve_provider_attempt) semantic_attempt += 1;
+                        if (empty_retry) empty_completion_retries += 1;
                         recovery_strategy = decision.strategy;
                         recovery_cause = cause;
                         retry_pacing = decision.next_pacing;
@@ -9257,6 +9380,48 @@ fn processQueuedPromptLoop(
             );
             recovery_has_unexecuted_tool_start = false;
         }
+        const empty_action = emptyCompletionAction(.{
+            .disposition = disposition,
+            .tool_call_count = completion.tool_calls.len,
+            .assistant_text = partial_assistant,
+            .nudge_available = !continuation_injected and silent_tool_steps >= 2,
+            .retries_used = empty_completion_retries,
+        });
+        switch (empty_action) {
+            .none => empty_completion_retries = 0,
+            .nudge => {},
+            // Recovery declined another retry, or the budget is spent: there is
+            // no answer to present, so end the turn instead of inventing one.
+            .retry, .fail => {
+                const length_limited = disposition == .length_limited;
+                debug_trace.eventf("agent", "empty_provider_completion", step_ctx, "action=fail finish_reason={s} retries_used={d} streamed_bytes={d}", .{
+                    completion.finish_reason.?.label(),
+                    empty_completion_retries,
+                    stream_ctx.streamed_output_bytes,
+                });
+                try pushTerminalAutoRetryStatusIfNeeded(
+                    deps,
+                    successful_recovery_strategy != null,
+                    semantic_attempt,
+                    semantic_limit,
+                    types.ModelFailureDiagnostic.init(empty_completion_diagnostic),
+                );
+                try finishFailedTurnWithNotice(
+                    deps,
+                    finalization,
+                    arena,
+                    job,
+                    within_turn_suffix.items,
+                    &summary_accumulator,
+                    stop_state,
+                    &finish_trace,
+                    if (length_limited) empty_length_completion_notice else empty_completion_notice,
+                    "empty_completion",
+                    if (length_limited) .length_limited else null,
+                );
+                return;
+            },
+        }
         const finish_reason = completion.finish_reason.?;
         if (successful_recovery_strategy != null) {
             try pushAutoRecoveredStatus(deps, semantic_attempt, semantic_limit);
@@ -9455,15 +9620,7 @@ fn processQueuedPromptLoop(
         }
 
         if (completion.tool_calls.len == 0) {
-            const has_content =
-                std.mem.trim(u8, partial_assistant, " \t\r\n").len > 0;
-            const needs_continuation =
-                disposition == .completed and
-                !continuation_injected and
-                silent_tool_steps >= 2 and
-                !has_content;
-
-            if (needs_continuation) {
+            if (empty_action == .nudge) {
                 continuation_injected = true;
                 const continuation_prompt = "Summarize what you just did.";
                 debug_trace.logf("agent", "injecting continuation after {d} silent tool steps omitted_assistant_bytes={d} preserved_provider_state={s}", .{
@@ -9482,11 +9639,11 @@ fn processQueuedPromptLoop(
                 continue;
             }
 
-            const raw_final = if (has_content) partial_assistant else "Done.";
-            const final_text = try runtime_assistant_stream.normalizeAssistantTextForDisplay(arena, raw_final);
-            const rendered = if (final_text.len > 0) final_text else "Done.";
-            const history_text = try arena.dupe(u8, raw_final);
-            const history_replay = if (has_content) final_provider_replay else try deps.agent_stream_provider.projectReplay(arena, final_provider_replay, &.{}, false, true);
+            // Answerless completions were retried, nudged, or failed above.
+            std.debug.assert(empty_action == .none);
+            const rendered = try runtime_assistant_stream.normalizeAssistantTextForDisplay(arena, partial_assistant);
+            const history_text = try arena.dupe(u8, partial_assistant);
+            const history_replay = final_provider_replay;
 
             if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
                 try append_pending_steering_after_assistant(
@@ -9508,9 +9665,6 @@ fn processQueuedPromptLoop(
                 try continue_pending_subagent(deps, arena, &within_turn_suffix, turn_id, step_ctx.step_id, history_text, history_replay)) continue;
 
             if (!lifecycle.view.hasStop() or stop_state.dispatched) {
-                if (!has_content) {
-                    try deps.push_text(deps.ctx, .{ .operational = rendered });
-                }
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
 
                 const persisted_text = try runtime_finalization.stopTerminalText(
@@ -9548,9 +9702,6 @@ fn processQueuedPromptLoop(
             });
             stop_state.retained_candidate = history_text;
             stop_state.latest_partial = null;
-            if (!has_content) {
-                try deps.push_text(deps.ctx, .{ .operational = rendered });
-            }
             try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
 
             var stop_outcome = runtime_lifecycle.dispatchStopCheckpoint(
@@ -12196,6 +12347,7 @@ fn processQueuedPromptLoop(
                 &finish_trace,
                 repeated_malformed_arguments_notice,
                 "repeated_malformed_tool_arguments",
+                null,
             );
             return;
         }
@@ -12278,13 +12430,13 @@ fn processQueuedPromptLoop(
                 &finish_trace,
                 repeated_shell_execution_failure_notice,
                 "repeated_shell_execution_failure",
+                null,
             );
             return;
         }
         if (terminal_provider_completion) {
             const raw_final = completion.content.?;
-            const final_text = try runtime_assistant_stream.normalizeAssistantTextForDisplay(arena, raw_final);
-            const rendered = if (final_text.len > 0) final_text else "Done.";
+            const rendered = try runtime_assistant_stream.normalizeAssistantTextForDisplay(arena, raw_final);
 
             if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
                 try append_pending_steering_after_assistant(
@@ -12431,6 +12583,7 @@ fn processQueuedPromptLoop(
         &finish_trace,
         config.step_limit_notice,
         "step_limit",
+        null,
     );
 }
 
@@ -12445,6 +12598,7 @@ fn finishFailedTurnWithNotice(
     finish_trace: *PromptFinishTrace,
     notice: []const u8,
     trace_outcome: []const u8,
+    disposition: ?types.ProviderCompletionDisposition,
 ) !void {
     try deps.push_text(deps.ctx, .{ .operational = notice });
     try deps.push_text(deps.ctx, .{ .operational = "\n" });
@@ -12464,7 +12618,7 @@ fn finishFailedTurnWithNotice(
             summary_accumulator,
             assistant_text,
             .failed,
-            null,
+            disposition,
             finish_trace,
             trace_outcome,
             null,
@@ -12483,7 +12637,7 @@ fn finishFailedTurnWithNotice(
     } };
     types.setHistoryTurnSummary(&turn, completed_summary);
     try deps.propagate_history_turn(deps.ctx, turn);
-    try finalization.finish(.failed, null, .{
+    try finalization.finish(.failed, disposition, .{
         .turn = try types.dupeHistoryTurn(std.heap.c_allocator, turn),
         .summary = completed_summary,
     });

@@ -207,6 +207,135 @@ test "processQueuedPrompt pauses tool calls without finish proof" {
     try std.testing.expectEqual(types.TurnPresentationOutcome.paused, hooks.finalized_outcome.?);
 }
 
+test "processQueuedPrompt never presents an empty provider completion as a completed answer" {
+    const alloc = std.testing.allocator;
+    const reasoning = [_][]const u8{"Checking whether the branch state is final before replying."};
+    const call_one = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
+    const call_two = [_]ToolCall{toolCall("call_2", "read_file", "{\"path\":\"b\"}")};
+    const empty_stop = FakeCompletion{ .finish_reason = .stop };
+    const empty_other = FakeCompletion{ .finish_reason = .other };
+    const blank_stop = FakeCompletion{ .content = " \n\t", .finish_reason = .stop };
+    // The reported shape: every output token went to hidden reasoning.
+    const empty_length = FakeCompletion{
+        .reasoning_chunks = &reasoning,
+        .finish_reason = .length,
+        .usage = .{ .input_tokens = 256_916, .output_tokens = 131_072 },
+    };
+    const Case = struct {
+        name: []const u8,
+        completions: []const FakeCompletion,
+    };
+    // Trailing empty completions absorb a bounded retry, so the contract holds
+    // whether the turn retries, pauses, or fails.
+    const cases = [_]Case{
+        .{ .name = "stop", .completions = &.{ empty_stop, empty_stop, empty_stop } },
+        .{ .name = "other", .completions = &.{ empty_other, empty_other, empty_other } },
+        .{ .name = "whitespace stop", .completions = &.{ blank_stop, blank_stop, blank_stop } },
+        .{ .name = "length after hidden reasoning", .completions = &.{ empty_length, empty_length, empty_length } },
+        .{ .name = "empty after silent-tool continuation", .completions = &.{
+            .{ .tool_calls = &call_one },
+            .{ .tool_calls = &call_two },
+            empty_stop,
+            empty_stop,
+            empty_stop,
+            empty_stop,
+        } },
+    };
+
+    for (cases) |case| {
+        errdefer std.debug.print("empty provider completion case: {s}\n", .{case.name});
+        var gateway = FakeGateway.init(alloc, case.completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        var fixture = PromptFixture{};
+        var config = fixture.config();
+        config.max_provider_attempts = 2;
+        // A scheduled auto-retry parks as a lifecycle pause instead of sleeping.
+        var pause_flag = std.atomic.Value(bool).init(false);
+        hooks.pause_on_auto_retry_status = true;
+        hooks.recovery_pause_flag = &pause_flag;
+        config.recovery_pause_flag = &pause_flag;
+
+        const returned_error: ?anyerror = if (runFakePrompt(&gateway, &hooks, config, fixture.job())) |_|
+            null
+        else |err|
+            err;
+
+        // fx must never fabricate an answer the provider did not produce.
+        try std.testing.expect(!textContains(&hooks, "Done."));
+        for ([_]?[]const u8{ hooks.finish_assistant_text, hooks.history_assistant_text }) |stored| {
+            const text = stored orelse continue;
+            try std.testing.expect(!std.mem.eql(u8, std.mem.trim(u8, text, " \t\r\n"), "Done."));
+        }
+        if (returned_error) |err| {
+            if (err != error.ModelError) return err;
+        } else {
+            const outcome = hooks.finalized_outcome orelse return error.TestExpectedTurnFinalization;
+            try std.testing.expect(outcome != .completed);
+        }
+    }
+}
+
+fn logContains(hooks: *const FakeAgentRuntimeDeps, needle: []const u8) bool {
+    for (hooks.log.items) |entry| {
+        if (std.mem.find(u8, entry, needle) != null) return true;
+    }
+    return false;
+}
+
+test "processQueuedPrompt retries an empty provider completion and presents the recovered answer" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{
+        .{ .finish_reason = .stop },
+        .{ .content = "Recovered answer" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+    try std.testing.expectEqualStrings("Recovered answer", hooks.finish_assistant_text.?);
+    try std.testing.expect(!textContains(&hooks, "Done."));
+    try std.testing.expect(logContains(&hooks, "empty response"));
+    try std.testing.expect(logContains(&hooks, "recovered"));
+}
+
+test "processQueuedPrompt fails visibly after consecutive empty provider completions" {
+    const alloc = std.testing.allocator;
+    const call = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &call },
+        .{ .finish_reason = .stop },
+        .{ .finish_reason = .stop },
+        .{ .finish_reason = .stop },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    // One tool step, then the first empty completion plus two bounded retries.
+    try std.testing.expectEqual(@as(usize, 4), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
+    try std.testing.expectEqual(@as(?types.ProviderCompletionDisposition, null), hooks.finalized_disposition);
+    try std.testing.expect(textContains(&hooks, "The provider returned an empty response"));
+    try std.testing.expect(!textContains(&hooks, "Done."));
+    // The failed turn keeps the executed tool and never persists a fabricated answer.
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items[0].assistant.execution.tool_steps.len);
+    try std.testing.expect(std.mem.find(u8, hooks.finish_assistant_text.?, "empty response") != null);
+}
+
 test "processQueuedPrompt preserves finish precedence over malformed argument recovery" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{.{
