@@ -4522,6 +4522,20 @@ const EmptyCompletionEvidence = struct {
     retries_used: usize,
 };
 
+/// Read after the request's parent-turn delivery is acknowledged: a subagent
+/// result sent with this request is no longer owed. An owed result can
+/// continue the turn only when another step is allowed.
+fn emptyCompletionContinuationPending(
+    deps: *const AgentRuntimeDeps,
+    stop_state: *const CommonStopState,
+    can_continue: bool,
+) bool {
+    if (stop_state.retained_candidate != null) return true;
+    if (!can_continue) return false;
+    const pending = deps.has_pending_subagent orelse return false;
+    return pending(deps.ctx);
+}
+
 /// Pure policy for completions without visible text or tool calls. The
 /// caller owns every effect: retrying, nudging, or finalizing the turn.
 fn emptyCompletionAction(evidence: EmptyCompletionEvidence) EmptyCompletionAction {
@@ -7278,8 +7292,7 @@ fn processQueuedPromptLoop(
             }
         }
         const empty_nudge_available = !continuation_injected and silent_tool_steps >= 2;
-        const empty_continuation_pending = stop_state.retained_candidate != null or
-            if (deps.has_pending_subagent) |pending| pending(deps.ctx) else false;
+        const can_continue_turn = agent_steps.allowsStep(config.agent_step_limit, step + 1);
 
         while (true) {
             if (reset_stream_for_next_attempt) {
@@ -8850,7 +8863,7 @@ fn processQueuedPromptLoop(
                     .tool_call_count = attempt_completion.tool_calls.len,
                     .assistant_text = partial_assistant,
                     .nudge_available = empty_nudge_available,
-                    .continuation_pending = empty_continuation_pending,
+                    .continuation_pending = emptyCompletionContinuationPending(deps, stop_state, can_continue_turn),
                     .retries_used = empty_completion_retries,
                 }) == .retry;
             var attempt_failure_diagnostic: ?types.ModelFailureDiagnostic = null;
@@ -9413,10 +9426,10 @@ fn processQueuedPromptLoop(
             .tool_call_count = completion.tool_calls.len,
             .assistant_text = partial_assistant,
             .nudge_available = empty_nudge_available,
-            .continuation_pending = empty_continuation_pending,
+            .continuation_pending = emptyCompletionContinuationPending(deps, stop_state, can_continue_turn),
             .retries_used = empty_completion_retries,
         });
-        // `.retry` here means recovery declined another attempt.
+        // `.retry` here means no retry was scheduled for this completion.
         const answerless = empty_action == .retry or empty_action == .finish;
         if (empty_action == .none) empty_completion_retries = 0;
         const finish_reason = completion.finish_reason.?;
@@ -9439,10 +9452,9 @@ fn processQueuedPromptLoop(
 
         if (answerless) {
             const length_limited = disposition == .length_limited;
-            const can_continue = agent_steps.allowsStep(config.agent_step_limit, step + 1);
             const reasoning_replay = try deps.agent_stream_provider.projectReplay(arena, final_provider_replay, &.{}, false, true);
             const settlement: AnswerlessSettlement = settlement: {
-                if (can_continue and try append_pending_steering_after_assistant(
+                if (can_continue_turn and try append_pending_steering_after_assistant(
                     deps,
                     arena,
                     &within_turn_suffix,
@@ -9452,7 +9464,7 @@ fn processQueuedPromptLoop(
                     config.origin,
                     if (!lifecycle.view.hasStop() or stop_state.dispatched) .finalizing else .model,
                 )) break :settlement .steering;
-                if (can_continue and disposition == .completed and try continue_pending_subagent(
+                if (can_continue_turn and disposition == .completed and try continue_pending_subagent(
                     deps,
                     arena,
                     &within_turn_suffix,
@@ -9470,8 +9482,14 @@ fn processQueuedPromptLoop(
                 stream_ctx.streamed_output_bytes,
             });
             switch (settlement) {
-                .steering, .subagent => continue,
+                .steering, .subagent => {
+                    // The continued request is new work with its own retries.
+                    empty_completion_retries = 0;
+                    try clearAutoRetryStatusIfNeeded(deps, successful_recovery_strategy != null);
+                    continue;
+                },
                 .retained => {
+                    try clearAutoRetryStatusIfNeeded(deps, successful_recovery_strategy != null);
                     stop_state.terminal_materializing = true;
                     try finishCommonAssistantTerminal(
                         deps,

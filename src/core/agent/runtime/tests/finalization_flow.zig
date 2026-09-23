@@ -325,10 +325,14 @@ test "processQueuedPrompt completes with a retained Stop answer when the continu
     try expectBodyNotContains(&follow_gateway, 0, "\"content\":[]");
 }
 
-test "processQueuedPrompt waits for a pending subagent instead of retrying an empty completion" {
+test "processQueuedPrompt waits for a running subagent instead of retrying an empty completion" {
     const alloc = std.testing.allocator;
+    const empty_stop = FakeCompletion{ .finish_reason = .stop };
     var gateway = FakeGateway.init(alloc, &.{
-        .{ .finish_reason = .stop },
+        // The child is still running, so the parent waits instead of retrying.
+        empty_stop,
+        // The request that delivers the result is ordinary work: retry its silence.
+        empty_stop,
         .{ .content = "Answer with the subagent result" },
     });
     defer gateway.deinit();
@@ -339,13 +343,37 @@ test "processQueuedPrompt waits for a pending subagent instead of retrying an em
 
     try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
 
-    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+    try expectBodyNotContains(&gateway, 0, "SUBAGENT_RESULT_OK");
+    try expectBodyContains(&gateway, 1, "SUBAGENT_RESULT_OK");
     try std.testing.expectEqual(@as(usize, 0), hooks.pending_subagent_results);
     try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
     try std.testing.expectEqualStrings("Answer with the subagent result", hooks.finish_assistant_text.?);
-    try std.testing.expect(!logContains(&hooks, "empty response"));
+    try std.testing.expect(logContains(&hooks, "empty response"));
     // The answerless step adds no empty assistant message to the next request.
     try expectBodyNotContains(&gateway, 1, "\"content\":[]");
+}
+
+test "processQueuedPrompt retries an empty completion on the last step despite a running subagent" {
+    const alloc = std.testing.allocator;
+    var gateway = FakeGateway.init(alloc, &.{
+        .{ .finish_reason = .stop },
+        .{ .content = "Answer within the step limit" },
+    });
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.pending_subagent_results = 1;
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.agent_step_limit = 1;
+
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+
+    // No further step can receive the result, so the silence is retried.
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+    try std.testing.expectEqualStrings("Answer within the step limit", hooks.finish_assistant_text.?);
 }
 
 test "processQueuedPrompt hands exhausted empty completions to pending steering" {
@@ -354,6 +382,8 @@ test "processQueuedPrompt hands exhausted empty completions to pending steering"
     var gateway = FakeGateway.init(alloc, &.{
         empty_stop,
         empty_stop,
+        empty_stop,
+        // The steered request gets its own bounded retry.
         empty_stop,
         .{ .content = "Steered answer" },
     });
@@ -368,12 +398,14 @@ test "processQueuedPrompt hands exhausted empty completions to pending steering"
 
     try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
 
-    try std.testing.expectEqual(@as(usize, 4), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 5), gateway.request_bodies.items.len);
     try expectBodyContainsInOrder(&gateway, 3, &.{ "user_steering", "narrow the scope" });
     try expectBodyNotContains(&gateway, 3, "\"content\":[]");
     try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
     try std.testing.expectEqualStrings("Steered answer", hooks.finish_assistant_text.?);
     try std.testing.expect(!textContains(&hooks, "The provider returned an empty response"));
+    // The retry status from the exhausted request does not linger.
+    try std.testing.expect(hooks.route_recovery_clear_count > 0);
 }
 
 test "processQueuedPrompt retries an empty provider completion and presents the recovered answer" {

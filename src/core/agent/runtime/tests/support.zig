@@ -498,6 +498,9 @@ fn captureReviewAuthority(
     return captured.toOwnedSlice(alloc);
 }
 
+/// Parent-turn context delivered once a waited-for fake subagent result is ready.
+pub const fake_subagent_result_context = "Subagent results: SUBAGENT_RESULT_OK";
+
 pub const FakeAgentRuntimeDeps = struct {
     alloc: Allocator,
     agent_stream_provider: agent_stream_provider.Provider = agent_stream_provider.unavailable_provider,
@@ -705,10 +708,10 @@ pub const FakeAgentRuntimeDeps = struct {
     immediate_steering_messages: []const []const u8 = &.{},
     immediate_steering_cancel_flag: ?*std.atomic.Value(bool) = null,
     immediate_steering_take_count: usize = 0,
-    /// Yielded subagent results each consumed by one parent wait.
+    /// Yielded subagent results still owed to the parent. As in the real host,
+    /// a wait only makes the result ready; its delivery acknowledgement clears it.
     pending_subagent_results: usize = 0,
-    subagent_waits: usize = 0,
-    usage_reports: usize = 0,
+    subagent_result_ready: bool = false,
     reported_output_tokens: u64 = 0,
 
     pub fn init(alloc: Allocator) FakeAgentRuntimeDeps {
@@ -853,7 +856,6 @@ pub const FakeAgentRuntimeDeps = struct {
 
     fn reportUsage(raw: *anyopaque, usage: types.Usage) void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
-        self.usage_reports += 1;
         self.reported_output_tokens += usage.output_tokens orelse 0;
     }
 
@@ -864,9 +866,8 @@ pub const FakeAgentRuntimeDeps = struct {
 
     fn waitForSubagent(raw: *anyopaque, _: u64, _: u64) !bool {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
-        self.subagent_waits += 1;
         if (self.pending_subagent_results == 0) return false;
-        self.pending_subagent_results -= 1;
+        self.subagent_result_ready = true;
         return true;
     }
 
@@ -1030,7 +1031,9 @@ pub const FakeAgentRuntimeDeps = struct {
     fn prepareParentTurnContext(raw: *anyopaque, arena: Allocator) !?runtime_deps.PreparedParentTurnContext {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         self.parent_turn_prepare_count += 1;
-        const text = if (self.parent_turn_context_texts.len > 0) blk: {
+        const text = if (self.subagent_result_ready)
+            fake_subagent_result_context
+        else if (self.parent_turn_context_texts.len > 0) blk: {
             const index = @min(self.parent_turn_context_index, self.parent_turn_context_texts.len - 1);
             self.parent_turn_context_index += 1;
             break :blk self.parent_turn_context_texts[index];
@@ -1057,6 +1060,10 @@ pub const FakeAgentRuntimeDeps = struct {
         acknowledgements: []const runtime_deps.ParentTurnDeliveryAck,
     ) void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        if (self.subagent_result_ready) {
+            self.subagent_result_ready = false;
+            self.pending_subagent_results -= 1;
+        }
         self.parent_turn_ack_count += acknowledgements.len;
         self.parent_turn_ack_contract_valid = self.parent_turn_ack_contract_valid and
             self.parent_turn_prepare_count == self.parent_turn_last_ack_prepare_count + 1;
