@@ -1488,7 +1488,7 @@ pub fn repairPersistedToolArguments(
             tracePersistedToolArgumentsRepair(call.*, source, true, integrity);
             continue;
         }
-        const failure_output = try tool_result_errors.malformedToolArgumentsJson(alloc, call.name);
+        const failure_output = try tool_result_errors.malformedToolArgumentsJson(alloc, call.name, null);
 
         alloc.free(result.output);
         if (result.output_handle) |handle| alloc.free(handle);

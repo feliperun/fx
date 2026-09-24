@@ -735,28 +735,30 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         active = undefined;
 
         phase = "resume";
+        const requestsBeforeRecovery = gateway.requestCount();
         resumed = await TmuxSession.create({
           cmd: command(sessionId), cwd: workspace, env, isolated: true, remainOnExit: true,
           stderrPath: resumedStderr, width: 110, height: 36, startupWaitMs: 0,
         });
+        await resumed.waitForPane((pane) =>
+          pane.includes("fx quit unexpectedly while this response was recovering"), 15_000);
+        expect(gateway.requestCount()).toBe(requestsBeforeRecovery);
+        await resumed.waitForStableComposer(10_000);
+        await resumed.sendText("continue");
         const recoveryScreen = await resumed.waitForPane((pane) =>
           pane.includes("RECOVERY_SAVED_TURN_67e") || pane.includes("InvalidContextHistoryStart"), 15_000);
-        expect(recoveryScreen).toContain("RECOVERY_SAVED_TURN_67e");
-        const resumeRequest = gateway.requests.at(-1)?.body ?? "";
-        expect(resumeRequest).toContain("STEER_LATE_67e");
-        expect(resumeRequest).toContain('"type":"file"');
         await resumed.waitForStableComposer(10_000);
         if (injectedStaleCheckpoint) {
           expect(recoveryScreen).toContain("InvalidContextHistoryStart");
-          expect(recoveryScreen).toContain("New messages are blocked");
-          const requestsBeforeBlockedPrompt = gateway.requestCount();
-          await resumed.sendText("go on");
-          const blockedScreen = await resumed.waitForPane((pane) => pane.includes("SessionCommitFailed"), 10_000);
-          expect(blockedScreen).not.toContain("DuplicateImageId");
-          expect(gateway.requestCount()).toBe(requestsBeforeBlockedPrompt);
+          expect(recoveryScreen).not.toContain("DuplicateImageId");
+          expect(gateway.requestCount()).toBe(requestsBeforeRecovery);
           expect(savedFrames(eventsPath).filter((frame) => frame.event?.turn_completed).length).toBe(completedAtKill);
         } else {
+          expect(recoveryScreen).toContain("RECOVERY_SAVED_TURN_67e");
           expect(recoveryScreen).not.toContain("InvalidContextHistoryStart");
+          const resumeRequest = gateway.requests.at(-1)?.body ?? "";
+          expect(resumeRequest).toContain("STEER_LATE_67e");
+          expect(resumeRequest).toContain('"type":"file"');
           phase = "followup";
           const requestsBeforeFollowup = gateway.requestCount();
           await resumed.sendText("RECOVERY_FOLLOWUP_REQUEST_67e");

@@ -2751,6 +2751,7 @@ const SseToolCallAccumulator = struct {
     arguments: std.ArrayList(u8),
     provisional_id: std.ArrayList(u8) = .empty,
     argument_integrity: types.ToolArgumentIntegrity = .valid,
+    argument_diagnostic: ?types.ToolArgumentDiagnostic = null,
     provider_result: ?[]u8 = null,
     provider_result_state: ProviderResultState = .none,
     final_identity: types.FinalToolIdentity = .valid,
@@ -2926,6 +2927,11 @@ const FinalToolInputState = enum {
     malformed,
 };
 
+const ClassifiedToolArguments = struct {
+    integrity: types.ToolArgumentIntegrity,
+    diagnostic: ?types.ToolArgumentDiagnostic = null,
+};
+
 fn appendSerializedToolArguments(
     alloc: std.mem.Allocator,
     destination: *std.ArrayList(u8),
@@ -2933,20 +2939,22 @@ fn appendSerializedToolArguments(
     call_id: []const u8,
     tool_name: []const u8,
     source: ToolArgumentSource,
-) !types.ToolArgumentIntegrity {
+) !ClassifiedToolArguments {
     const integrity = try types.ToolArgumentIntegrity.classifySerialized(alloc, serialized);
     if (integrity == .valid) {
         try destination.appendSlice(alloc, serialized);
-        return .valid;
+        return .{ .integrity = .valid };
     }
 
+    // The raw bytes are replaced below; keep what the model needs to repair them.
+    const diagnostic = try types.ToolArgumentDiagnostic.diagnose(alloc, serialized);
     try destination.appendSlice(alloc, "{}");
     debug_trace.logf(
         "sse",
-        "event=tool_argument_integrity call_id={s} tool_name={s} source={s} bytes={d} failure=malformed_json",
-        .{ call_id, tool_name, @tagName(source), serialized.len },
+        "event=tool_argument_integrity call_id={s} tool_name={s} source={s} bytes={d} failure=malformed_json diagnosis={s} error_offset={?d}",
+        .{ call_id, tool_name, @tagName(source), serialized.len, @tagName(diagnostic.failure), diagnostic.error_offset },
     );
-    return .malformed_json;
+    return .{ .integrity = .malformed_json, .diagnostic = diagnostic };
 }
 
 fn appendSupportedFinalInput(
@@ -2955,7 +2963,7 @@ fn appendSupportedFinalInput(
     input: std.json.Value,
     call_id: []const u8,
     tool_name: []const u8,
-) !types.ToolArgumentIntegrity {
+) !ClassifiedToolArguments {
     switch (input) {
         .string => |value| {
             return try appendSerializedToolArguments(
@@ -2972,7 +2980,7 @@ fn appendSupportedFinalInput(
             defer out.deinit();
             std.json.Stringify.value(input, .{}, &out.writer) catch return error.OutOfMemory;
             try destination.appendSlice(alloc, out.written());
-            return .valid;
+            return .{ .integrity = .valid };
         },
         else => {
             try destination.appendSlice(alloc, "{}");
@@ -2981,7 +2989,7 @@ fn appendSupportedFinalInput(
                 "event=tool_argument_integrity call_id={s} tool_name={s} source=final_value input_kind={s} failure=malformed_json",
                 .{ call_id, tool_name, @tagName(input) },
             );
-            return .malformed_json;
+            return .{ .integrity = .malformed_json };
         },
     }
 }
@@ -3189,6 +3197,7 @@ fn materializeToolCalls(
             .name = name,
             .arguments_json = arguments,
             .argument_integrity = acc.argument_integrity,
+            .argument_diagnostic = acc.argument_diagnostic,
             .provisional_id = provisional_id,
             .provider_result = provider_result,
             .final_identity = acc.final_identity,
@@ -3795,15 +3804,16 @@ fn consumeSseStreamTraced(
             }
 
             const final_input_state = if (root.object.get("input")) |input_value| blk: {
-                const integrity = try appendSupportedFinalInput(
+                const classified = try appendSupportedFinalInput(
                     alloc,
                     &acc.arguments,
                     input_value,
                     acc.id.items,
                     acc.name.items,
                 );
-                acc.argument_integrity = integrity;
-                break :blk if (integrity == .valid)
+                acc.argument_integrity = classified.integrity;
+                acc.argument_diagnostic = classified.diagnostic;
+                break :blk if (classified.integrity == .valid)
                     FinalToolInputState.valid
                 else
                     FinalToolInputState.malformed;
@@ -3829,14 +3839,18 @@ fn consumeSseStreamTraced(
                 if (stream_index) |index| {
                     const record = &streamed_tool_inputs.items[index];
                     switch (record.state) {
-                        .ended => acc.argument_integrity = try appendSerializedToolArguments(
-                            alloc,
-                            &acc.arguments,
-                            record.arguments.items,
-                            acc.id.items,
-                            acc.name.items,
-                            .streamed_fallback,
-                        ),
+                        .ended => {
+                            const classified = try appendSerializedToolArguments(
+                                alloc,
+                                &acc.arguments,
+                                record.arguments.items,
+                                acc.id.items,
+                                acc.name.items,
+                                .streamed_fallback,
+                            );
+                            acc.argument_integrity = classified.integrity;
+                            acc.argument_diagnostic = classified.diagnostic;
+                        },
                         .open => setProviderResultFailure(
                             &provider_result_identity_failure,
                             .incomplete_streamed_input,
@@ -5151,11 +5165,13 @@ test "consumeSseStream preserves valid serialized scalar roots" {
 test "consumeSseStream replaces malformed trailing or duplicate-key serialized final input with safe JSON" {
     const Case = struct {
         input: []const u8,
+        failure: types.ToolArgumentDiagnostic.Failure,
     };
     const cases = [_]Case{
-        .{ .input = "{]FX_FINAL_MALFORMED_SENTINEL" },
-        .{ .input = "{} FX_FINAL_TRAILING_SENTINEL" },
-        .{ .input = "{\"depth\":1,\"depth\":2}" },
+        .{ .input = "{]FX_FINAL_MALFORMED_SENTINEL", .failure = .syntax_error },
+        .{ .input = "{} FX_FINAL_TRAILING_SENTINEL", .failure = .syntax_error },
+        .{ .input = "{\"depth\":1,\"depth\":2}", .failure = .rejected_value },
+        .{ .input = "{\"request\":{\"task\":\"FX_FINAL_TRUNCATED_SENTINEL", .failure = .truncated },
     };
 
     for (cases) |case| {
@@ -5181,8 +5197,12 @@ test "consumeSseStream replaces malformed trailing or duplicate-key serialized f
         var completion = try consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag);
         defer deinitGatewayCompletion(std.testing.allocator, &completion);
 
-        try std.testing.expectEqualStrings("{}", completion.tool_calls[0].arguments_json);
-        try std.testing.expectEqual(types.ToolArgumentIntegrity.malformed_json, completion.tool_calls[0].argument_integrity);
+        const call = completion.tool_calls[0];
+        try std.testing.expectEqualStrings("{}", call.arguments_json);
+        try std.testing.expectEqual(types.ToolArgumentIntegrity.malformed_json, call.argument_integrity);
+        const diagnostic = call.argument_diagnostic.?;
+        try std.testing.expectEqual(case.failure, diagnostic.failure);
+        try std.testing.expectEqual(case.input.len, diagnostic.input_bytes);
     }
 }
 
@@ -5344,6 +5364,9 @@ test "consumeSseStream replaces malformed exact-id ended fallback with safe JSON
 
     try std.testing.expectEqualStrings("{}", completion.tool_calls[0].arguments_json);
     try std.testing.expectEqual(types.ToolArgumentIntegrity.malformed_json, completion.tool_calls[0].argument_integrity);
+    const diagnostic = completion.tool_calls[0].argument_diagnostic.?;
+    try std.testing.expectEqual(types.ToolArgumentDiagnostic.Failure.syntax_error, diagnostic.failure);
+    try std.testing.expectEqual(@as(?usize, 1), diagnostic.error_offset);
 }
 
 test "consumeSseStream does not publish labels from malformed streamed arguments" {
