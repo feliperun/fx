@@ -4662,20 +4662,30 @@ describe("gateway stream lifecycle", () => {
     writeFileSync(clipboardStub, "#!/bin/sh\nexit 1\n");
     chmodSync(clipboardStub, 0o755);
     const marker = join(root.workspace, "executions.txt");
+    const invalidInput = '{"request":{"action":"run","command":"touch MUST_NOT_EXECUTE"';
     let step = 0;
     const gateway = startGateway((body) => {
       switch (step++) {
         case 0:
           return fakeGatewaySse([
-            { type: "tool-call", toolCallId: "invalid_shell", toolName: "shell", input: '{"request":{"action":"run","command":"touch MUST_NOT_EXECUTE"' },
+            { type: "tool-call", toolCallId: "invalid_shell", toolName: "shell", input: invalidInput },
             { type: "tool-call", toolCallId: "valid_shell", toolName: "shell", input: { request: { action: "run", command: "printf 'once\\n' >> executions.txt", profile: "clean" } } },
             { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
           ]);
-        case 1:
-          expect(toolResultOutput(body, "invalid_shell")).toContain("Tool arguments were not valid JSON.");
+        case 1: {
+          const rejection = toolResultOutput(body, "invalid_shell");
+          expect(rejection).not.toContain("MUST_NOT_EXECUTE");
+          const error = JSON.parse(rejection).error;
+          expect(error.message).toContain("Tool arguments ended before the JSON was complete");
+          expect(error.details).toEqual({
+            failure: "truncated",
+            received_bytes: invalidInput.length,
+            error_offset: invalidInput.length,
+          });
           expect(shellResult(body, "valid_shell").exit_code).toBe(0);
           expect(readFileSync(marker, "utf8")).toBe("once\n");
           return fakeGatewayFinalText("REJECTION_RECOVERED");
+        }
         case 2:
           return fakeGatewayToolCall("later_shell", "shell", { request: { action: "run", command: "printf 'later\\n' >> executions.txt", profile: "clean" } });
         case 3:

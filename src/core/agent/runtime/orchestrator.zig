@@ -77,6 +77,8 @@ const CredentialRefreshMode = runtime_deps.CredentialRefreshMode;
 const http_error_detail_max_bytes: usize = 4096;
 const assistant_prefill_recovery_prompt =
     "Continue from the preceding tool result.";
+pub const assistant_tail_continuation_prompt =
+    "Continue from the conversation above.";
 const repeated_terminal_validation_notice =
     "Repeated shell validation failures stopped the tool loop. The invalid shell calls were not executed and produced no shell effect.";
 const repeated_shell_execution_failure_notice =
@@ -978,16 +980,6 @@ fn project_subagent_request_messages(
         if (message.role != .assistant) continue;
         for (message.tool_calls) |call| {
             if (!std.mem.eql(u8, call.name, "subagent")) continue;
-            if (call.argument_integrity == .malformed_json) {
-                try calls.append(alloc, .{
-                    .assistant_index = message_index,
-                    .id = call.id,
-                    .action = "malformed",
-                    .disposition = .inert,
-                });
-                needs_projection = true;
-                continue;
-            }
             if (legacy_subagent_action(call.arguments_json)) |action| {
                 try calls.append(alloc, .{
                     .assistant_index = message_index,
@@ -1119,7 +1111,7 @@ fn project_subagent_request_messages(
     return projected;
 }
 
-test "non-object subagent rejection keeps its call and result during projection" {
+test "rejected subagent arguments keep their call and result during projection" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const alloc = arena_state.allocator();
@@ -1142,7 +1134,10 @@ test "non-object subagent rejection keeps its call and result during projection"
         .{ .role = .tool, .tool_call_id = "rejected", .tool_name = "subagent", .content = "not executed", .tool_result_status = .failure },
         .{ .role = .tool, .tool_call_id = "valid", .tool_name = "read_file", .content = "contents", .tool_result_status = .success },
     };
-    for (0..2) |_| {
+    // Rewriting a malformed call into an assistant-role summary would leave
+    // the next request ending in assistant prefill.
+    for ([_]types.ToolArgumentIntegrity{ .non_object_json, .malformed_json, .valid }) |integrity| {
+        calls[0].argument_integrity = integrity;
         const projected = try project_subagent_request_messages(
             alloc,
             .{ .tools = &.{tool} },
@@ -1158,7 +1153,6 @@ test "non-object subagent rejection keeps its call and result during projection"
         try std.testing.expectEqualStrings("rejected", projected[1].tool_call_id.?);
         try std.testing.expectEqualStrings("not executed", projected[1].content.?);
         try std.testing.expectEqual(types.PersistedToolStatus.failure, projected[1].tool_result_status.?);
-        calls[0].argument_integrity = .valid;
     }
 }
 
@@ -4345,20 +4339,111 @@ test "context overflow recovery is typed safe and bounded" {
     ));
 }
 
-fn isPostVisionAssistantPrefillRejection(
+/// fx never asks a model to extend an assistant message, and models without
+/// prefill support reject that shape. Returns `source` unchanged, or an
+/// `arena` copy ending with a host continuation when history projection left
+/// the conversation on an assistant message.
+fn with_replyable_conversation_tail(
+    arena: Allocator,
+    source: []const ChatMessage,
+) Allocator.Error![]const ChatMessage {
+    if (source.len == 0 or source[source.len - 1].role != .assistant) return source;
+    const projected = try arena.alloc(ChatMessage, source.len + 1);
+    @memcpy(projected[0..source.len], source);
+    projected[source.len] = .{ .role = .user, .content = assistant_tail_continuation_prompt };
+    return projected;
+}
+
+test "request tail ends with a user continuation instead of assistant prefill" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const replyable = [_]ChatMessage{
+        .{ .role = .user, .content = "go" },
+        .{ .role = .tool, .tool_call_id = "call", .tool_name = "read_file", .content = "result" },
+    };
+    try std.testing.expectEqual(@as([*]const ChatMessage, &replyable), (try with_replyable_conversation_tail(arena, &replyable)).ptr);
+    try std.testing.expectEqual(@as(usize, 0), (try with_replyable_conversation_tail(arena, &.{})).len);
+
+    const prefill = [_]ChatMessage{
+        .{ .role = .user, .content = "go" },
+        .{ .role = .assistant, .content = "[Prior subagent create action completed.]" },
+    };
+    const repaired = try with_replyable_conversation_tail(arena, &prefill);
+    try std.testing.expectEqual(@as(usize, 3), repaired.len);
+    try std.testing.expectEqualStrings(prefill[1].content.?, repaired[1].content.?);
+    try std.testing.expectEqual(types.ChatRole.user, repaired[2].role);
+    try std.testing.expectEqualStrings(assistant_tail_continuation_prompt, repaired[2].content.?);
+    try std.testing.expectEqual(types.ChatRole.assistant, prefill[1].role);
+}
+
+test "legacy subagent history at the tail stays replyable after projection" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const tool = tool_dispatch.Tool{
+        .name = "subagent",
+        .description = "subagent",
+        .model_schema = .{ .name = "subagent", .description = "subagent" },
+        .executor_kind = .subagent,
+        .decode = undefined,
+        .call = undefined,
+        .reads_only_fn = undefined,
+        .irreversible_fn = undefined,
+    };
+    const calls = [_]ToolCall{.{
+        .id = "legacy",
+        .name = "subagent",
+        .arguments_json = "{\"command\":{\"create\":{\"name\":\"worker\",\"mode\":\"persistent\",\"prompt\":\"do it\"}}}",
+    }};
+    const messages = [_]ChatMessage{
+        .{ .role = .user, .content = "delegate" },
+        .{ .role = .assistant, .tool_calls = &calls },
+        .{ .role = .tool, .tool_call_id = "legacy", .tool_name = "subagent", .content = "not executed", .tool_result_status = .failure },
+    };
+    const projected = try project_subagent_request_messages(
+        arena,
+        .{ .tools = &.{tool} },
+        true,
+        &messages,
+        agent_stream_provider.unavailable_provider,
+        .{ .provider = .gateway, .model = "test" },
+    );
+    try std.testing.expectEqual(types.ChatRole.assistant, projected[projected.len - 1].role);
+    const request = try with_replyable_conversation_tail(arena, projected);
+    try std.testing.expectEqual(types.ChatRole.user, request[request.len - 1].role);
+    try std.testing.expectEqualStrings(assistant_tail_continuation_prompt, request[request.len - 1].content.?);
+}
+
+/// Some provider routes reject a request that ends with tool results as an
+/// assistant prefill. Returns the tail tool name when that happened.
+fn postToolAssistantPrefillRejection(
     status: std.http.Status,
     detail: []const u8,
     messages: []const ChatMessage,
-) bool {
-    if (status != .bad_request or messages.len == 0) return false;
+) ?[]const u8 {
+    if (status != .bad_request or messages.len == 0) return null;
     const tail = messages[messages.len - 1];
-    if (tail.role != .tool or
-        !std.mem.eql(u8, tail.tool_name orelse return false, "vision"))
+    if (tail.role != .tool) return null;
+    if (std.mem.find(u8, detail, "does not support assistant message prefill") == null or
+        std.mem.find(u8, detail, "must end with a user message") == null)
     {
-        return false;
+        return null;
     }
-    return std.mem.find(u8, detail, "does not support assistant message prefill") != null and
-        std.mem.find(u8, detail, "must end with a user message") != null;
+    return tail.tool_name orelse "unknown";
+}
+
+test "assistant prefill rejection recovers after any tool result tail" {
+    const detail = "AI_APICallError: This model does not support assistant message prefill. The conversation must end with a user message.";
+    const after_tool = [_]ChatMessage{
+        .{ .role = .user, .content = "go" },
+        .{ .role = .tool, .tool_call_id = "call", .tool_name = "subagent", .content = "failed" },
+    };
+    try std.testing.expectEqualStrings("subagent", postToolAssistantPrefillRejection(.bad_request, detail, &after_tool).?);
+    try std.testing.expect(postToolAssistantPrefillRejection(.bad_request, "other failure", &after_tool) == null);
+    try std.testing.expect(postToolAssistantPrefillRejection(.too_many_requests, detail, &after_tool) == null);
+    const after_user = [_]ChatMessage{.{ .role = .user, .content = "go" }};
+    try std.testing.expect(postToolAssistantPrefillRejection(.bad_request, detail, &after_user) == null);
 }
 
 fn recovery_deadline(delay_ns: u64) std.Io.Clock.Timestamp {
@@ -7270,7 +7355,10 @@ fn processQueuedPromptLoop(
             }
             const materialized_messages = if (request_capabilities.image_input_support == .native) try runtime_execution_memory.materializeToolImages(overlay_arena, config, result_request_messages) else result_request_messages;
             const image_projection = try runtime_gateway_step.projectToolImageMessages(overlay_arena, materialized_messages, request_capabilities.image_input_support, vision_policy.route == .fallback, config.max_tool_result_bytes);
-            const request_messages = image_projection.messages;
+            const request_messages = try with_replyable_conversation_tail(overlay_arena, image_projection.messages);
+            if (request_messages.ptr != image_projection.messages.ptr) {
+                debug_trace.eventf("history", "assistant_tail_continued", step_ctx, "messages={d}", .{image_projection.messages.len});
+            }
             // Tool images withheld because the catalog could not confirm image
             // input are invisible in the transcript otherwise. Tell the user
             // once per turn, and only when the catalog itself is known to be
@@ -8273,26 +8361,28 @@ fn processQueuedPromptLoop(
             const gateway_wait_finished_ms = io_mod.milliTimestamp();
             summary_accumulator.addThinkingWait(gateway_wait_started_ms, stream_ctx.first_model_output_at_ms orelse gateway_wait_finished_ms);
 
-            if (!assistant_prefill_recovery_used and
+            const prefill_tool_name: ?[]const u8 = if (!assistant_prefill_recovery_used and
                 semantic_attempt + 1 < semantic_limit and
-                streamReplaySafe(&stream_ctx) and
-                isPostVisionAssistantPrefillRejection(
+                streamReplaySafe(&stream_ctx))
+                postToolAssistantPrefillRejection(
                     if (response_failure) |failure| failureHttpStatus(failure.kind) else .ok,
                     if (response_failure) |failure| failure.detail orelse "" else "",
                     request_messages,
-                ))
-            {
-                try within_turn_suffix.append(arena, .{
-                    .role = .user,
-                    .content = assistant_prefill_recovery_prompt,
-                });
+                )
+            else
+                null;
+            if (prefill_tool_name) |tool_name| {
                 debug_trace.eventf(
                     "gateway",
                     "assistant_prefill_recovery",
                     step_ctx,
-                    "tool_name=vision provider_attempt={d}/{d}",
-                    .{ semantic_attempt + 1, semantic_limit },
+                    "tool_name={s} provider_attempt={d}/{d}",
+                    .{ tool_name, semantic_attempt + 1, semantic_limit },
                 );
+                try within_turn_suffix.append(arena, .{
+                    .role = .user,
+                    .content = assistant_prefill_recovery_prompt,
+                });
                 stream_result.deinit(arena);
                 stream_result_set = false;
                 assistant_prefill_recovery_used = true;

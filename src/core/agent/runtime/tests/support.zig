@@ -218,6 +218,28 @@ pub const FakeCompletion = struct {
     cancel_during_tool_stream: bool = false,
 };
 
+/// Fails a model request whose prompt ends on an assistant message, and one the
+/// runtime had to continue unless the test expects that repair.
+pub fn expectReplyablePromptTail(alloc: Allocator, payload: []const u8, allow_continuation: bool) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, payload, .{}) catch return;
+    defer parsed.deinit();
+    if (parsed.value != .object) return;
+    const prompt = parsed.value.object.get("prompt") orelse return;
+    if (prompt != .array or prompt.array.items.len == 0) return;
+    const tail = prompt.array.items[prompt.array.items.len - 1];
+    if (tail != .object) return;
+    const role = tail.object.get("role") orelse return;
+    if (role != .string) return;
+    if (std.mem.eql(u8, role.string, "assistant")) return error.TestAssistantPrefillRequest;
+    if (allow_continuation or !std.mem.eql(u8, role.string, "user")) return;
+    const content = tail.object.get("content") orelse return;
+    if (content != .array or content.array.items.len != 1 or content.array.items[0] != .object) return;
+    const text = content.array.items[0].object.get("text") orelse return;
+    if (text == .string and std.mem.eql(u8, text.string, runtime_orchestrator.assistant_tail_continuation_prompt)) {
+        return error.TestAssistantTailContinued;
+    }
+}
+
 pub const FakeGateway = struct {
     alloc: Allocator,
     completions: []const FakeCompletion,
@@ -229,6 +251,9 @@ pub const FakeGateway = struct {
     admitted_requests: usize = 0,
     recovery_pause_flag: ?*std.atomic.Value(bool) = null,
     observe_request: ?*const fn (agent_stream_provider.ModelRequest) anyerror!void = null,
+    /// A continued tail means history projection ended on an assistant
+    /// message. Only tests of that repair may accept it.
+    allow_assistant_tail_continuation: bool = false,
 
     pub fn init(alloc: Allocator, completions: []const FakeCompletion) FakeGateway {
         return .{ .alloc = alloc, .completions = completions };
@@ -263,6 +288,7 @@ pub const FakeGateway = struct {
         const payload = request.prepared_request_body orelse
             try builtin_gateway.buildAgentRequest(alloc, request.data());
         defer if (request.prepared_request_body == null) alloc.free(payload);
+        try expectReplyablePromptTail(alloc, payload, self.allow_assistant_tail_continuation);
         try self.request_bodies.append(self.alloc, try self.alloc.dupe(u8, payload));
         try self.request_models.append(self.alloc, try self.alloc.dupe(u8, request.model));
         try self.request_api_keys.append(self.alloc, try self.alloc.dupe(u8, request.credential.secret() orelse ""));

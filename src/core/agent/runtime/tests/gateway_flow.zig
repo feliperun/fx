@@ -22,6 +22,7 @@ const lifecycle_hooks = @import("../../../hooks/hooks.zig");
 const tool_dispatch = @import("../../../tooling/tool_dispatch.zig");
 const model_tool_schema = @import("../../../tooling/model_tool_schema.zig");
 const prompt_context = @import("../prompt_context.zig");
+const runtime_orchestrator = @import("../orchestrator.zig");
 
 const test_support = @import("support.zig");
 
@@ -714,6 +715,102 @@ test "processQueuedPrompt recovers when a model rejects post-Vision assistant pr
     );
     try std.testing.expectEqual(@as(?std.http.Status, null), hooks.http_status);
     try std.testing.expectEqualStrings("Recovered final answer", hooks.finish_assistant_text.?);
+}
+
+test "fake gateway rejects assistant prefill and unexpected tail continuations" {
+    const alloc = std.testing.allocator;
+    const check = test_support.expectReplyablePromptTail;
+    try check(alloc, "{\"prompt\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"go\"}]}]}", false);
+    try check(alloc, "{\"prompt\":[{\"role\":\"user\",\"content\":[]},{\"role\":\"tool\",\"content\":[]}]}", false);
+    try std.testing.expectError(
+        error.TestAssistantPrefillRequest,
+        check(alloc, "{\"prompt\":[{\"role\":\"user\",\"content\":[]},{\"role\":\"assistant\",\"content\":[]}]}", true),
+    );
+    const continued = try std.fmt.allocPrint(
+        alloc,
+        "{{\"prompt\":[{{\"role\":\"assistant\",\"content\":[]}},{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"{s}\"}}]}}]}}",
+        .{runtime_orchestrator.assistant_tail_continuation_prompt},
+    );
+    defer alloc.free(continued);
+    try std.testing.expectError(error.TestAssistantTailContinued, check(alloc, continued, false));
+    try check(alloc, continued, true);
+}
+
+fn expectMalformedArgumentFeedback(
+    gateway: *const FakeGateway,
+    index: usize,
+    failure: []const u8,
+    received_bytes: usize,
+) !void {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, gateway.request_bodies.items[index], .{});
+    defer parsed.deinit();
+    const prompt = parsed.value.object.get("prompt").?.array.items;
+    const tail = prompt[prompt.len - 1].object;
+    try std.testing.expectEqualStrings("tool", tail.get("role").?.string);
+    const result = tail.get("content").?.array.items[0].object;
+    try std.testing.expectEqualStrings("error-text", result.get("output").?.object.get("type").?.string);
+    var feedback = try std.json.parseFromSlice(std.json.Value, alloc, result.get("output").?.object.get("value").?.string, .{});
+    defer feedback.deinit();
+    const details = feedback.value.object.get("error").?.object.get("details").?.object;
+    try std.testing.expectEqualStrings(failure, details.get("failure").?.string);
+    try std.testing.expectEqual(@as(i64, @intCast(received_bytes)), details.get("received_bytes").?.integer);
+}
+
+test "processQueuedPrompt returns diagnosed feedback so the model can correct malformed arguments" {
+    const alloc = std.testing.allocator;
+    const malformed = [_]ToolCall{toolCall("call_cut", "read_file", "{\"path\":\"a")};
+    const corrected = [_]ToolCall{toolCall("call_fixed", "read_file", "{\"path\":\"a\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &malformed },
+        .{ .tool_calls = &corrected },
+        .{ .content = "Read after correcting the call" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+    try expectMalformedArgumentFeedback(&gateway, 1, "truncated", malformed[0].arguments_json.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
+    try std.testing.expectEqualStrings("read_file", hooks.executed_names.items[0]);
+    try std.testing.expectEqualStrings("Read after correcting the call", hooks.finish_assistant_text.?);
+}
+
+test "processQueuedPrompt recovers when a model rejects assistant prefill after a malformed tool call" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall("call_bad_prefill", "read_file", "{\"path\":\"a\",}")};
+    const prefill_rejection =
+        "{\"error\":{\"message\":\"AI_APICallError: This model does not support " ++
+        "assistant message prefill. The conversation must end with a user message.\"}}";
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .status = .bad_request, .err_body = prefill_rejection },
+        .{ .content = "Recovered after malformed call" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+    try expectMalformedArgumentFeedback(&gateway, 1, "syntax_error", calls[0].arguments_json.len);
+    try expectGatewayPromptTailText(
+        &gateway,
+        2,
+        .user,
+        "Continue from the preceding tool result.",
+    );
+    try std.testing.expectEqual(@as(?std.http.Status, null), hooks.http_status);
+    try std.testing.expectEqualStrings("Recovered after malformed call", hooks.finish_assistant_text.?);
 }
 
 test "text-only Vision keeps later permission restriction trusted across model steps" {
