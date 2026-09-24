@@ -3284,9 +3284,14 @@ fn parseSseUsage(root: std.json.Value) types.Usage {
     if (root != .object) return .{};
     const usage_value = root.object.get("usage") orelse return .{};
     if (usage_value != .object) return .{};
+    const input_tokens = parseSseTokenTotal(usage_value, "inputTokens");
+    const cache_read_tokens = parseSseTokenDetail(usage_value, "inputTokens", "cacheRead");
     return .{
-        .input_tokens = parseSseTokenTotal(usage_value, "inputTokens"),
+        .input_tokens = input_tokens,
         .output_tokens = parseSseTokenTotal(usage_value, "outputTokens"),
+        // Cache reads are part of the input total; a larger value is dropped
+        // like any other malformed optional detail.
+        .cache_read_tokens = if (cache_read_tokens != null and input_tokens != null and cache_read_tokens.? > input_tokens.?) null else cache_read_tokens,
         .reasoning_tokens = parseSseTokenDetail(usage_value, "outputTokens", "reasoning"),
     };
 }
@@ -4293,7 +4298,7 @@ test "consumeSseStream captures exact terminal billing" {
     try std.testing.expectEqual(@as(u64, 2), billing.billable_web_search_calls);
 }
 
-test "consumeSseStream surfaces finish reasoning tokens in turn usage" {
+test "consumeSseStream surfaces finish reasoning and cache read tokens in turn usage" {
     const Noop = struct {
         fn chunk(_: *anyopaque, _: []const u8) void {}
     };
@@ -4314,6 +4319,35 @@ test "consumeSseStream surfaces finish reasoning tokens in turn usage" {
     try std.testing.expectEqual(@as(?u64, 10), completion.usage.input_tokens);
     try std.testing.expectEqual(@as(?u64, 25), completion.usage.output_tokens);
     try std.testing.expectEqual(@as(?u64, 5), completion.usage.reasoning_tokens);
+    try std.testing.expectEqual(@as(?u64, null), completion.usage.cache_read_tokens);
+
+    const cached =
+        "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"},\"usage\":{\"inputTokens\":{\"total\":130,\"cacheRead\":20},\"outputTokens\":{\"total\":25}}}\n\n";
+    var cached_reader = std.Io.Reader.fixed(cached);
+    var cached_completion = try consumeSseStream(
+        std.testing.allocator,
+        &cached_reader,
+        undefined,
+        Noop.chunk,
+        null,
+        &cancel_flag,
+    );
+    defer deinitGatewayCompletion(std.testing.allocator, &cached_completion);
+    try std.testing.expectEqual(@as(?u64, 20), cached_completion.usage.cache_read_tokens);
+
+    const oversized =
+        "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"},\"usage\":{\"inputTokens\":{\"total\":10,\"cacheRead\":11},\"outputTokens\":{\"total\":25}}}\n\n";
+    var oversized_reader = std.Io.Reader.fixed(oversized);
+    var oversized_completion = try consumeSseStream(
+        std.testing.allocator,
+        &oversized_reader,
+        undefined,
+        Noop.chunk,
+        null,
+        &cancel_flag,
+    );
+    defer deinitGatewayCompletion(std.testing.allocator, &oversized_completion);
+    try std.testing.expectEqual(@as(?u64, null), oversized_completion.usage.cache_read_tokens);
 
     const malformed =
         "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"},\"usage\":{\"outputTokens\":{\"total\":25,\"reasoning\":\"5\"}}}\n\n";

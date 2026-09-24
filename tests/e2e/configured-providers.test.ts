@@ -143,6 +143,24 @@ describe("configured providers", () => {
     } finally { f.close(); }
   });
 
+  test.each([
+    { name: "OpenAI-compatible details", usage: { prompt_tokens_details: { cached_tokens: 9 } }, cached: 9 },
+    { name: "DeepSeek hit and miss counters", usage: { prompt_cache_hit_tokens: 8, prompt_cache_miss_tokens: 4 }, cached: 8 },
+    { name: "no cache breakdown", usage: {}, cached: null },
+  ])("ask JSON reports prompt cache reads from $name", async ({ usage, cached }) => {
+    const f = fixture(async body => {
+      const response = completion(body.model);
+      const wire = (await response.text()).replace('"total_tokens":15}', `"total_tokens":15${JSON.stringify(usage).slice(1, -1) ? "," + JSON.stringify(usage).slice(1, -1) : ""}}`);
+      return new Response(wire, { headers: response.headers });
+    });
+    try {
+      const result = await runFx(["ask", "--json", "--no-save", "say hello"], { cwd: f.workspace, env: f.env });
+      expect(result.code).toBe(0);
+      expect(result.stderr).toBe("");
+      expect(JSON.parse(result.stdout).usage).toEqual({ input_tokens: 12, output_tokens: 3, cache_read_tokens: cached });
+    } finally { f.close(); }
+  });
+
   test("CLI selection persists a configured name and uses only its credential", async () => {
     const f = fixture();
     try {
