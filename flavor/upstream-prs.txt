@@ -1,0 +1,4 @@
+# Upstream pull requests carrying flavor patches: <number> <patch subject>.
+# A merged PR's commit disappears from the flavor on the next sync, because
+# the rebase finds the same change already upstream.
+1043 Report prompt cache reads from Chat Completions providers
