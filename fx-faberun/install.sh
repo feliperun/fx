@@ -1,13 +1,13 @@
 #!/bin/sh
-# Install the fx flavor: the official fx plus the patches on
-# https://github.com/feliperun/fx/tree/flavor.
+# Install fx-faberun: the official fx plus the patches on
+# https://github.com/feliperun/fx/tree/fx-faberun.
 #
 #   curl -fsSL https://github.com/feliperun/fx/releases/latest/download/install.sh | sh
 #
 # Environment:
 #   FX_INSTALL_DIR       where `fx` goes (default: ~/.local/bin)
-#   FX_FLAVOR_VERSION    a release tag such as v0.0.11-faberun.1 (default: latest)
-#   FX_FLAVOR_ARCHIVE    install this local fx-<os>-<arch>.tar.gz instead of downloading;
+#   FX_FABERUN_VERSION    a release tag such as v0.0.11-faberun.1 (default: latest)
+#   FX_FABERUN_ARCHIVE    install this local fx-<os>-<arch>.tar.gz instead of downloading;
 #                        its .sha256 must sit beside it
 #
 # Idempotent: installing the version already present only re-verifies it.
@@ -19,24 +19,24 @@ install_dir=${FX_INSTALL_DIR:-$HOME/.local/bin}
 case "$(uname -s)" in
   Darwin) os=macos ;;
   Linux) os=linux ;;
-  *) printf '[fail] fx · no flavor build for %s\n' "$(uname -s)" >&2; exit 1 ;;
+  *) printf '[fail] fx · no fx-faberun build for %s\n' "$(uname -s)" >&2; exit 1 ;;
 esac
 case "$(uname -m)" in
   arm64 | aarch64) arch=aarch64 ;;
   x86_64 | amd64) arch=x86_64 ;;
-  *) printf '[fail] fx · no flavor build for %s\n' "$(uname -m)" >&2; exit 1 ;;
+  *) printf '[fail] fx · no fx-faberun build for %s\n' "$(uname -m)" >&2; exit 1 ;;
 esac
 asset="fx-$os-$arch.tar.gz"
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
-if [ -n "${FX_FLAVOR_ARCHIVE:-}" ]; then
-  cp "$FX_FLAVOR_ARCHIVE" "$work/$asset"
-  cp "$FX_FLAVOR_ARCHIVE.sha256" "$work/$asset.sha256"
+if [ -n "${FX_FABERUN_ARCHIVE:-}" ]; then
+  cp "$FX_FABERUN_ARCHIVE" "$work/$asset"
+  cp "$FX_FABERUN_ARCHIVE.sha256" "$work/$asset.sha256"
 else
-  if [ -n "${FX_FLAVOR_VERSION:-}" ]; then
-    base="https://github.com/$repo/releases/download/$FX_FLAVOR_VERSION"
+  if [ -n "${FX_FABERUN_VERSION:-}" ]; then
+    base="https://github.com/$repo/releases/download/$FX_FABERUN_VERSION"
   else
     base="https://github.com/$repo/releases/latest/download"
   fi
@@ -59,7 +59,7 @@ tar -xzf "$work/$asset" -C "$work" fx
 version=$("$work/fx" --version 2>/dev/null | head -1)
 case "$version" in
   *-faberun.*) ;;
-  *) printf '[fail] fx · %s is not a flavor build (%s)\n' "$asset" "$version" >&2; exit 1 ;;
+  *) printf '[fail] fx · %s is not an fx-faberun build (%s)\n' "$asset" "$version" >&2; exit 1 ;;
 esac
 
 mkdir -p "$install_dir"
@@ -67,7 +67,7 @@ if [ -x "$install_dir/fx" ] && [ "$("$install_dir/fx" --version 2>/dev/null | he
   printf '[ok] fx · %s already installed at %s/fx\n' "$version" "$install_dir"
   exit 0
 fi
-# Replace atomically: a running fx keeps its inode, the next launch gets the flavor.
+# Replace atomically: a running fx keeps its inode, the next launch gets fx-faberun.
 cp "$work/fx" "$install_dir/.fx.new"
 chmod 755 "$install_dir/.fx.new"
 mv -f "$install_dir/.fx.new" "$install_dir/fx"

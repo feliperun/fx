@@ -716,7 +716,7 @@ const App = struct {
         if (env_disabled or !auto_upgrade.shouldEnableForCurrentExecutable()) {
             app.auto_upgrade_enabled = false;
         }
-        // A faberun build (version `X.Y.Z-faberun.N`) carries patches the
+        // An fx-faberun build (version `X.Y.Z-faberun.N`) carries patches the
         // official channel lacks; upgrading would silently replace it.
         if (comptime std.mem.indexOf(u8, version, "-faberun.") != null) app.auto_upgrade_enabled = false;
         if (comptime !host_profile.auto_upgrade) app.auto_upgrade_enabled = false;

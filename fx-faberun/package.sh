@@ -1,21 +1,21 @@
 #!/bin/sh
-# Build release archives of the flavor, named like the official ones
+# Build release archives of fx-faberun, named like the official ones
 # (fx-<os>-<arch>.tar.gz plus .sha256), with the version X.Y.Z-faberun.N.
 #
-#   flavor/package.sh <N> [target ...]
+#   fx-faberun/package.sh <N> [target ...]
 #
 # Targets default to the host. The version is stamped into src/main.zig for
 # the build only and restored afterwards, so the committed source always
 # carries the upstream version and never conflicts on a sync.
 set -eu
 
-build=${1:?usage: flavor/package.sh <flavor build number> [zig-target ...]}
+build=${1:?usage: fx-faberun/package.sh <build number> [zig-target ...]}
 shift
 root=$(git rev-parse --show-toplevel)
 cd "$root"
 base=$(sed -n 's/^pub const version = "\(.*\)";/\1/p' src/main.zig)
 version="$base-faberun.$build"
-dist="$root/zig-out/flavor-dist"
+dist="$root/zig-out/fx-faberun-dist"
 mkdir -p "$dist"
 
 cp src/main.zig "$dist/.main.zig.orig"
