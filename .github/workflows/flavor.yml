@@ -1,0 +1,133 @@
+name: Flavor
+
+# The fork's watcher. Every six hours it rebases the flavor branch onto the
+# official fx, builds and tests the result, pushes it when it moved, and
+# reports where every flavor patch's upstream pull request stands. Packaging
+# runs only when dispatched by hand and ends in a DRAFT release: publishing
+# stays a human decision.
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      package:
+        description: Build release archives and open a draft release
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: flavor
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: flavor
+          fetch-depth: 0
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: "0.16.0"
+
+      - name: Rebase onto upstream
+        id: sync
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name "flavor-sync"
+          git config user.email "flavor-sync@users.noreply.github.com"
+          before=$(git rev-parse HEAD)
+          set +e
+          flavor/sync.sh | tee "$RUNNER_TEMP/sync.txt"
+          status=${PIPESTATUS[0]}
+          set -e
+          cat "$RUNNER_TEMP/sync.txt" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$status" -eq 2 ]; then
+            title="Flavor sync conflicts with upstream $(git rev-parse --short upstream/main)"
+            if [ -z "$(gh issue list --state open --search "$title in:title" --json number --jq '.[].number')" ]; then
+              gh issue create --title "$title" --body "$(cat "$RUNNER_TEMP/sync.txt")"
+            fi
+            exit 1
+          fi
+          echo "changed=$([ "$(git rev-parse HEAD)" != "$before" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - name: Build and test
+        run: |
+          zig build
+          zig build test --summary none
+
+      - name: Push
+        if: steps.sync.outputs.changed == 'true'
+        run: git push --force-with-lease origin HEAD:flavor
+
+  package:
+    needs: sync
+    if: github.event_name == 'workflow_dispatch' && inputs.package
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            targets: x86_64-linux aarch64-linux
+          - runner: macos-15
+            targets: aarch64-macos x86_64-macos
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: flavor
+          fetch-depth: 0
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: "0.16.0"
+
+      - name: Package
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          base=$(sed -n 's/^pub const version = "\(.*\)";/\1/p' src/main.zig)
+          n=$(( $(gh release list --limit 200 --json tagName --jq "[.[] | select(.tagName | startswith(\"v$base-flavor.\"))] | length") + 1 ))
+          flavor/package.sh "$n" ${{ matrix.targets }}
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dist-${{ matrix.runner }}
+          path: zig-out/flavor-dist/fx-*.tar.gz*
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: matrix.runner == 'ubuntu-latest'
+        with:
+          name: version
+          path: zig-out/flavor-dist/VERSION
+
+  draft-release:
+    needs: package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: flavor
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Open a draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(cat dist/VERSION)
+          cp flavor/install.sh dist/install.sh
+          gh release create "v$version" --draft --target flavor --title "fx $version" \
+            --notes "Official fx plus the flavor patches. Install: curl -fsSL https://github.com/feliperun/fx/releases/latest/download/install.sh | sh" \
+            dist/fx-*.tar.gz dist/fx-*.tar.gz.sha256 dist/install.sh
