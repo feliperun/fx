@@ -7,7 +7,7 @@ plus a short queue of patches, kept as commits on top of upstream `main`:
 | --- | --- | --- |
 | Report prompt cache reads from Chat Completions providers | DeepSeek and other OpenAI-compatible providers return cache counters fx dropped | [#1043](https://github.com/vercel-labs/fx/pull/1043) |
 | Stop the skill walk at the repository when HOME is not above it | a workspace outside HOME made fx load skills from every directory up to `/` | [#1045](https://github.com/vercel-labs/fx/pull/1045) |
-| Keep an fx-faberun build from upgrading itself to the official channel | the stable auto-upgrade would replace fx-faberun and drop its patches | flavor only |
+| Keep an fx-faberun build from upgrading itself to the official channel | the stable auto-upgrade would replace fx-faberun and drop its patches | fx-faberun only |
 
 ## Install
 
