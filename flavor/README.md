@@ -34,4 +34,4 @@ when something changed: a conflict, failing patch tests, a new upstream version
 or an upstream pull request that moved.
 
 Releases are built only on a manual dispatch with `package: true`, versioned
-`X.Y.Z-flavor.N`, and created as drafts. Publishing one is a human decision.
+`X.Y.Z-faberun.N`, and created as drafts. Publishing one is a human decision.
