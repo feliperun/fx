@@ -1,8 +1,8 @@
-name: Flavor
+name: fx-faberun
 
-# The fork's watcher. Every six hours it rebases the flavor branch onto the
+# The fork's watcher. Every six hours it rebases the fx-faberun branch onto the
 # official fx, builds and tests the result, pushes it when it moved, and
-# reports where every flavor patch's upstream pull request stands. Packaging
+# reports where every fx-faberun patch's upstream pull request stands. Packaging
 # runs only when dispatched by hand and ends in a DRAFT release: publishing
 # stays a human decision.
 
@@ -21,7 +21,7 @@ permissions:
   issues: write
 
 concurrency:
-  group: flavor
+  group: fx-faberun
   cancel-in-progress: false
 
 jobs:
@@ -30,7 +30,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: flavor
+          ref: fx-faberun
           fetch-depth: 0
 
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
@@ -42,16 +42,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          git config user.name "flavor-sync"
-          git config user.email "flavor-sync@users.noreply.github.com"
+          git config user.name "fx-faberun-sync"
+          git config user.email "fx-faberun-sync@users.noreply.github.com"
           before=$(git rev-parse HEAD)
           set +e
-          flavor/sync.sh | tee "$RUNNER_TEMP/sync.txt"
+          fx-faberun/sync.sh | tee "$RUNNER_TEMP/sync.txt"
           status=${PIPESTATUS[0]}
           set -e
           cat "$RUNNER_TEMP/sync.txt" >> "$GITHUB_STEP_SUMMARY"
           if [ "$status" -eq 2 ]; then
-            title="Flavor sync conflicts with upstream $(git rev-parse --short upstream/main)"
+            title="fx-faberun sync conflicts with upstream $(git rev-parse --short upstream/main)"
             if [ -z "$(gh issue list --state open --search "$title in:title" --json number --jq '.[].number')" ]; then
               gh issue create --title "$title" --body "$(cat "$RUNNER_TEMP/sync.txt")"
             fi
@@ -66,7 +66,7 @@ jobs:
 
       - name: Push
         if: steps.sync.outputs.changed == 'true'
-        run: git push --force-with-lease origin HEAD:flavor
+        run: git push --force-with-lease origin HEAD:fx-faberun
 
   package:
     needs: sync
@@ -83,7 +83,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: flavor
+          ref: fx-faberun
           fetch-depth: 0
 
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
@@ -96,18 +96,18 @@ jobs:
         run: |
           base=$(sed -n 's/^pub const version = "\(.*\)";/\1/p' src/main.zig)
           n=$(( $(gh release list --limit 200 --json tagName --jq "[.[] | select(.tagName | startswith(\"v$base-faberun.\"))] | length") + 1 ))
-          flavor/package.sh "$n" ${{ matrix.targets }}
+          fx-faberun/package.sh "$n" ${{ matrix.targets }}
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: dist-${{ matrix.runner }}
-          path: zig-out/flavor-dist/fx-*.tar.gz*
+          path: zig-out/fx-faberun-dist/fx-*.tar.gz*
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: matrix.runner == 'ubuntu-latest'
         with:
           name: version
-          path: zig-out/flavor-dist/VERSION
+          path: zig-out/fx-faberun-dist/VERSION
 
   draft-release:
     needs: package
@@ -115,7 +115,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: flavor
+          ref: fx-faberun
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -127,7 +127,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           version=$(cat dist/VERSION)
-          cp flavor/install.sh dist/install.sh
-          gh release create "v$version" --draft --target flavor --title "fx $version" \
-            --notes "Official fx plus the flavor patches. Install: curl -fsSL https://github.com/feliperun/fx/releases/latest/download/install.sh | sh" \
+          cp fx-faberun/install.sh dist/install.sh
+          gh release create "v$version" --draft --target fx-faberun --title "fx $version" \
+            --notes "Official fx plus the fx-faberun patches. Install: curl -fsSL https://github.com/feliperun/fx/releases/latest/download/install.sh | sh" \
             dist/fx-*.tar.gz dist/fx-*.tar.gz.sha256 dist/install.sh
