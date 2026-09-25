@@ -23,7 +23,7 @@ if [ "$(git merge-base HEAD upstream/main)" = "$upstream_head" ]; then
   echo "[ok] flavor already sits on upstream $(git rev-parse --short upstream/main)"
 else
   before=$(git rev-parse HEAD)
-  if ! git rebase --quiet upstream/main; then
+  if ! git -c commit.gpgsign=false rebase --quiet upstream/main; then
     git rebase --abort
     echo "[fail] a flavor patch conflicts with upstream $(git rev-parse --short upstream/main); resolve it by hand" >&2
     exit 2

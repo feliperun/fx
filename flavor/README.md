@@ -27,5 +27,11 @@ force-pushed. A patch that conflicts opens an issue instead. When an upstream
 pull request in `upstream-prs.txt` merges, the next rebase drops that patch on its
 own, because the same change is already upstream.
 
+Without GitHub Actions, `flavor/watch.sh` does one pass of the same work on an
+operator's machine, and `flavor/watch-install.sh` schedules it every six hours
+(launchd on macOS, cron on Linux). It notifies through `FX_FLAVOR_NOTIFY` only
+when something changed: a conflict, failing patch tests, a new upstream version
+or an upstream pull request that moved.
+
 Releases are built only on a manual dispatch with `package: true`, versioned
 `X.Y.Z-flavor.N`, and created as drafts. Publishing one is a human decision.
