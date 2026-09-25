@@ -38,7 +38,9 @@ for target in "$@"; do
   # shellcheck disable=SC2086
   zig build -Doptimize=ReleaseSafe $flag -p "$prefix"
   cp LICENSE THIRD_PARTY_NOTICES.md "$prefix/bin/"
-  tar -czf "$dist/$name.tar.gz" -C "$prefix/bin" fx LICENSE THIRD_PARTY_NOTICES.md
+  # No extended attributes: a macOS tar records com.apple.provenance, which
+  # GNU tar warns about on every extraction.
+  COPYFILE_DISABLE=1 tar --no-xattrs -czf "$dist/$name.tar.gz" -C "$prefix/bin" fx LICENSE THIRD_PARTY_NOTICES.md
   (cd "$dist" && if command -v sha256sum >/dev/null 2>&1; then sha256sum "$name.tar.gz"; else shasum -a 256 "$name.tar.gz"; fi > "$name.tar.gz.sha256")
   echo "[ok] $dist/$name.tar.gz ($version)"
 done
