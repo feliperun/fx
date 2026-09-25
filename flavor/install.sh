@@ -6,7 +6,7 @@
 #
 # Environment:
 #   FX_INSTALL_DIR       where `fx` goes (default: ~/.local/bin)
-#   FX_FLAVOR_VERSION    a release tag such as v0.0.11-flavor.1 (default: latest)
+#   FX_FLAVOR_VERSION    a release tag such as v0.0.11-faberun.1 (default: latest)
 #   FX_FLAVOR_ARCHIVE    install this local fx-<os>-<arch>.tar.gz instead of downloading;
 #                        its .sha256 must sit beside it
 #
@@ -58,7 +58,7 @@ fi
 tar -xzf "$work/$asset" -C "$work" fx
 version=$("$work/fx" --version 2>/dev/null | head -1)
 case "$version" in
-  *-flavor.*) ;;
+  *-faberun.*) ;;
   *) printf '[fail] fx · %s is not a flavor build (%s)\n' "$asset" "$version" >&2; exit 1 ;;
 esac
 

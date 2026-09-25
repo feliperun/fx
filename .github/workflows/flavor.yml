@@ -95,7 +95,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           base=$(sed -n 's/^pub const version = "\(.*\)";/\1/p' src/main.zig)
-          n=$(( $(gh release list --limit 200 --json tagName --jq "[.[] | select(.tagName | startswith(\"v$base-flavor.\"))] | length") + 1 ))
+          n=$(( $(gh release list --limit 200 --json tagName --jq "[.[] | select(.tagName | startswith(\"v$base-faberun.\"))] | length") + 1 ))
           flavor/package.sh "$n" ${{ matrix.targets }}
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

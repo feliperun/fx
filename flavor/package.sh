@@ -1,6 +1,6 @@
 #!/bin/sh
 # Build release archives of the flavor, named like the official ones
-# (fx-<os>-<arch>.tar.gz plus .sha256), with the version X.Y.Z-flavor.N.
+# (fx-<os>-<arch>.tar.gz plus .sha256), with the version X.Y.Z-faberun.N.
 #
 #   flavor/package.sh <N> [target ...]
 #
@@ -14,7 +14,7 @@ shift
 root=$(git rev-parse --show-toplevel)
 cd "$root"
 base=$(sed -n 's/^pub const version = "\(.*\)";/\1/p' src/main.zig)
-version="$base-flavor.$build"
+version="$base-faberun.$build"
 dist="$root/zig-out/flavor-dist"
 mkdir -p "$dist"
 
