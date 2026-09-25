@@ -716,6 +716,9 @@ const App = struct {
         if (env_disabled or !auto_upgrade.shouldEnableForCurrentExecutable()) {
             app.auto_upgrade_enabled = false;
         }
+        // A flavor build (version `X.Y.Z-flavor.N`) carries patches the
+        // official channel lacks; upgrading would silently replace it.
+        if (comptime std.mem.indexOf(u8, version, "-flavor.") != null) app.auto_upgrade_enabled = false;
         if (comptime !host_profile.auto_upgrade) app.auto_upgrade_enabled = false;
         try HostConfigAppRuntime.restore(&app, builtin_modes.registry);
         SessionAppRuntime.syncTerminalTitle(&app);
