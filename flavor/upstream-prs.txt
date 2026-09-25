@@ -2,3 +2,4 @@
 # A merged PR's commit disappears from the flavor on the next sync, because
 # the rebase finds the same change already upstream.
 1043 Report prompt cache reads from Chat Completions providers
+1045 Stop the skill walk at the repository when HOME is not above it
