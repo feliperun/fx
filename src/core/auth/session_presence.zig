@@ -5,18 +5,41 @@ const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 
+/// The home whose `.fx` holds credentials: `FX_AUTH_HOME` when set, else
+/// `HOME`. fx-faberun runs each worker under a throwaway HOME (its own
+/// settings, no personal skills), while the ChatGPT, Grok and Vercel sessions
+/// must stay in the operator's real profile: a copy would diverge on the first
+/// token refresh, and a link fails the single-link, no-symlink checks below.
+pub fn credentialHome() ?[]const u8 {
+    return credentialHomeFrom(io_mod.getenv("FX_AUTH_HOME"), io_mod.getenv("HOME"));
+}
+
+fn credentialHomeFrom(auth_home: ?[]const u8, home: ?[]const u8) ?[]const u8 {
+    if (auth_home) |value| {
+        if (value.len > 0) return value;
+    }
+    return home;
+}
+
+test "FX_AUTH_HOME names the credential home and an empty value falls back to HOME" {
+    try std.testing.expectEqualStrings("/real", credentialHomeFrom("/real", "/throwaway").?);
+    try std.testing.expectEqualStrings("/throwaway", credentialHomeFrom("", "/throwaway").?);
+    try std.testing.expectEqualStrings("/throwaway", credentialHomeFrom(null, "/throwaway").?);
+    try std.testing.expect(credentialHomeFrom(null, null) == null);
+}
+
 pub fn profileFile(
     file_name: []const u8,
     max_bytes: usize,
 ) host.SecretStorePresence {
     if (comptime host_target.is_wasm) return .missing;
-    return profileFileFromHome(io_mod.getenv("HOME"), file_name, max_bytes);
+    return profileFileFromHome(credentialHome(), file_name, max_bytes);
 }
 
 /// Returns whether the credential file exists after checking both write targets.
 pub fn requireWritableProfileFile(file_name: []const u8, lock_name: []const u8) error{CredentialStorageUnavailable}!bool {
     if (comptime host_target.is_wasm) return false;
-    const home = io_mod.getenv("HOME") orelse return error.CredentialStorageUnavailable;
+    const home = credentialHome() orelse return error.CredentialStorageUnavailable;
     var home_dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }) catch return error.CredentialStorageUnavailable;
     defer home_dir.close(io_mod.getIo());
     var profile_dir = home_dir.openDir(io_mod.getIo(), profile_paths.root_dir_name, .{
