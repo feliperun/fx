@@ -374,7 +374,7 @@ pub fn Runtime(comptime App: type) type {
                 .available_sources = app.auth.pickerView().available_sources,
             });
             if (candidates[0]) |target| {
-                try startProviderSwitch(app, target, false, .manual, candidates[1]);
+                try startProviderSwitch(app, target, false, .manual, candidates[1], null);
                 return;
             }
             try app.writeDomainNotice(.{
@@ -1125,7 +1125,19 @@ pub fn Runtime(comptime App: type) type {
             allow_login: bool,
             intent: ProviderSwitchIntent,
         ) !void {
-            try startProviderSwitch(app, target, allow_login, intent, null);
+            try startProviderSwitch(app, target, allow_login, intent, null, null);
+        }
+
+        /// Reaches a provider the picker does not list, so `/model` can cross
+        /// into a configured connection. A null model keeps the target's saved
+        /// preference; the preparation thread resolves it against the target
+        /// catalog before the switch commits.
+        pub fn switchToModel(
+            app: *App,
+            target: model_provider.ProviderId,
+            model: ?[]const u8,
+        ) !void {
+            try startProviderSwitch(app, target, false, .manual, null, model);
         }
 
         fn startProviderSwitch(
@@ -1134,6 +1146,7 @@ pub fn Runtime(comptime App: type) type {
             allow_login: bool,
             intent: ProviderSwitchIntent,
             fallback: ?model_provider.ProviderId,
+            primary_model: ?[]const u8,
         ) !void {
             if (comptime !provider_runtime.supported(App) or
                 !@hasDecl(App, "providerCatalog") or
@@ -1198,7 +1211,7 @@ pub fn Runtime(comptime App: type) type {
                 .catalog_provider = catalog_provider,
                 .models_path = app.model_cache.models_path,
                 .preferred_source = if (target == .gateway) settings.credential_source else null,
-                .primary_model = if (intent == .post_oauth and provider_runtime.provider(app).eql(target)) provider_runtime.model(app) else null,
+                .primary_model = primary_model orelse (if (intent == .post_oauth and provider_runtime.provider(app).eql(target)) provider_runtime.model(app) else null),
                 .preferred_model = if (intent == .post_oauth) settings.models.get(target) else io_mod.getenv("FX_MODEL") orelse settings.models.get(target),
             });
         }
@@ -1236,7 +1249,8 @@ pub fn Runtime(comptime App: type) type {
                 }, true);
                 return;
             };
-            const body = try std.fmt.allocPrint(app.alloc, "Preparing {s}.", .{provider_catalog.label(input.target())});
+            const target = input.target();
+            const body = try std.fmt.allocPrint(app.alloc, "Preparing {s}.", .{provider_catalog.displayLabel(&target)});
             defer app.alloc.free(body);
             try app.writeDomainNotice(.{
                 .topic = "provider",
@@ -1274,7 +1288,7 @@ pub fn Runtime(comptime App: type) type {
             }
             if (task.input.intent == .provider) {
                 if (task.input.intent.provider.fallback) |target| {
-                    try startProviderSwitch(app, target, false, .manual, null);
+                    try startProviderSwitch(app, target, false, .manual, null, null);
                     if (app.auth.providerPreparationPending()) return;
                 }
             }
@@ -1383,7 +1397,7 @@ pub fn Runtime(comptime App: type) type {
             const body = try std.fmt.allocPrint(
                 app.alloc,
                 "Switched to {s} with {s}.",
-                .{ provider_catalog.label(target), provider_runtime.model(app) },
+                .{ provider_catalog.displayLabel(&target), provider_runtime.model(app) },
             );
             defer app.alloc.free(body);
             if (comptime @hasDecl(App, "persistRuntimePreferences")) {
