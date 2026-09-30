@@ -1,10 +1,12 @@
 const std = @import("std");
 const build_options = @import("build_options");
+const app_auth_runtime = @import("../app/app_auth_runtime.zig");
 const app_permission_runtime = @import("../app/app_permission_runtime.zig");
 const app_session_runtime = @import("../app/app_session_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const collections = @import("../shared/collections.zig");
 const config_runtime = @import("../config/config_runtime.zig");
+const configured_provider = @import("../config/configured_provider.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host = @import("../hosts/host.zig");
 const io_mod = @import("../shared/io.zig");
@@ -355,8 +357,22 @@ pub fn Commands(comptime App: type) type {
 
         pub fn handleModel(app: *App, query: []const u8) !void {
             if (query.len == 0) {
-                try app.writeDomainNotice(.{ .topic = "model", .tone = .neutral, .body = provider_runtime.model(app) }, true);
+                try writeCurrentModel(app);
                 return;
+            }
+
+            // A configured connection is named in `/model` by its own id, and its
+            // models are only reachable through it, so resolve those before the
+            // active provider's catalog gets a chance to answer with a literal.
+            if (comptime @hasField(App, "provider_selection")) {
+                if (try resolveProviderSwitch(app, query)) |target| {
+                    defer if (target.model) |model| app.alloc.free(model);
+                    if (!provider_runtime.provider(app).eql(target.provider)) {
+                        return app_auth_runtime.Runtime(App).switchToModel(app, target.provider, target.model);
+                    }
+                    if (target.model) |model| return setResolvedModel(app, model, true);
+                    return writeCurrentModel(app);
+                }
             }
 
             const resolved = try resolveModelQuery(app, query);
@@ -1142,6 +1158,59 @@ pub fn Commands(comptime App: type) type {
 
         fn fetchModelIds(app: *App) !std.ArrayList([]u8) {
             return app.fetchModelIds();
+        }
+
+        fn writeCurrentModel(app: *App) !void {
+            try app.writeDomainNotice(.{ .topic = "model", .tone = .neutral, .body = provider_runtime.model(app) }, true);
+        }
+
+        const ProviderSwitch = struct {
+            provider: model_provider.ProviderId,
+            /// Canonical id when the query named a model; null when it named a
+            /// provider, which keeps that provider's saved model preference.
+            model: ?[]u8,
+        };
+
+        /// `/model <id>` today only reaches the active provider's catalog, which
+        /// is why a configured connection could not be entered from inside a
+        /// session. A query that is one of its model ids, or its own id, is a
+        /// switch target instead. The active connection is asked first so its
+        /// models keep winning ties.
+        fn resolveProviderSwitch(app: *App, query: []const u8) !?ProviderSwitch {
+            const active = provider_runtime.provider(app);
+            if (active == .configured) {
+                if (try configuredSwitchForModel(app, active, query)) |target| return target;
+            }
+            for (app.provider_selection.definitions.definitions) |definition| {
+                if (active == .configured and std.mem.eql(u8, active.label(), definition.id)) continue;
+                const provider = model_provider.parse(definition.id) orelse continue;
+                if (try configuredSwitchForModel(app, provider, query)) |target| return target;
+            }
+
+            const named = model_provider.parse(query) orelse return null;
+            if (named != .configured) return .{ .provider = named, .model = null };
+            // Session and user metadata reject a configured provider without its
+            // binding, so the switch must carry the definition's identity.
+            const registry = app.provider_selection.definitions;
+            if (registry.get(named.label()) == null) return null;
+            return .{ .provider = named.bind(registry) catch return null, .model = null };
+        }
+
+        fn configuredSwitchForModel(
+            app: *App,
+            provider: model_provider.ProviderId,
+            query: []const u8,
+        ) !?ProviderSwitch {
+            const registry = app.provider_selection.definitions;
+            const definition = registry.get(provider.label()) orelse return null;
+            for (definition.model_metadata) |metadata| {
+                if (!std.ascii.eqlIgnoreCase(metadata.id, query)) continue;
+                return .{
+                    .provider = provider.bind(registry) catch return null,
+                    .model = try app.alloc.dupe(u8, metadata.id),
+                };
+            }
+            return null;
         }
 
         fn resolveModelQuery(app: *App, query: []const u8) ![]u8 {
@@ -2358,6 +2427,54 @@ test "session_commands handleModel resolves fuzzy cached model and syncs queued 
     );
     try expectTranscriptContains(&app, "* Switched to anthropic/claude-sonnet-4-20250514");
 }
+
+test "session_commands /model reaches a configured provider" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"deepseek":{"protocol":"openai-chat-completions","base_url":"https://api.deepseek.com",
+        \\"auth":{"type":"bearer","env":"DEEPSEEK_API_KEY"},
+        \\"model_metadata":{"deepseek-flash":{"context_window":1048576,"max_output_tokens":393216}}},
+        \\"glm":{"protocol":"openai-chat-completions","base_url":"https://api.z.ai/api/coding/paas/v4",
+        \\"auth":{"type":"bearer","env":"ZAI_API_KEY"},
+        \\"model_metadata":{"glm-5.3-flash":{"context_window":1048576,"max_output_tokens":131072},
+        \\"glm-5.3":{"context_window":1048576,"max_output_tokens":131072}}}}
+    , .{});
+    defer parsed.deinit();
+
+    var app = SwitchApp{ .alloc = alloc, .provider_selection = provider_runtime.Runtime.init(alloc) };
+    defer app.provider_selection.deinit();
+    app.provider_selection.definitions = try configured_provider.Registry.parse(alloc, parsed.value);
+    app.provider_selection.active_provider = model_provider.parse("deepseek").?;
+
+    const cross = (try Commands(SwitchApp).resolveProviderSwitch(&app, "glm-5.3-flash")).?;
+    defer alloc.free(cross.model.?);
+    try std.testing.expectEqualStrings("glm", cross.provider.label());
+    try std.testing.expectEqualStrings("glm-5.3-flash", cross.model.?);
+
+    // The active connection answers for its own models, casing included.
+    const own = (try Commands(SwitchApp).resolveProviderSwitch(&app, "DEEPSEEK-FLASH")).?;
+    defer alloc.free(own.model.?);
+    try std.testing.expectEqualStrings("deepseek", own.provider.label());
+    try std.testing.expectEqualStrings("deepseek-flash", own.model.?);
+
+    // A provider id alone switches; the target's saved model stays the choice.
+    const named = (try Commands(SwitchApp).resolveProviderSwitch(&app, "glm")).?;
+    try std.testing.expectEqualStrings("glm", named.provider.label());
+    try std.testing.expect(named.model == null);
+
+    const builtin = (try Commands(SwitchApp).resolveProviderSwitch(&app, "codex")).?;
+    try std.testing.expectEqual(model_provider.ProviderId.codex, builtin.provider);
+    try std.testing.expect(builtin.model == null);
+
+    // Everything else stays a model query for the active provider.
+    try std.testing.expect(try Commands(SwitchApp).resolveProviderSwitch(&app, "gpt-4o") == null);
+    try std.testing.expect(try Commands(SwitchApp).resolveProviderSwitch(&app, "nonexistent") == null);
+}
+
+const SwitchApp = struct {
+    alloc: std.mem.Allocator,
+    provider_selection: provider_runtime.Runtime,
+};
 
 test "session_commands handleModel falls back to raw query when model fetch fails" {
     const alloc = std.testing.allocator;
