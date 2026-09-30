@@ -72,6 +72,18 @@ pub fn label(id: model_provider.ProviderId) []const u8 {
     return find(id).route_name;
 }
 
+/// Name a configured connection after the id the operator gave it: that is the
+/// only handle that tells two of them apart in a notice, and it is what they
+/// typed to reach it. Built-in routes keep their catalog name.
+///
+/// Takes a pointer on purpose: the returned slice borrows the id's inline
+/// bytes, so it must outlive the call. Passed by value it would name a dead
+/// copy — measured 2026-09-30, printing "Preparing gl.".
+pub fn displayLabel(id: *const model_provider.ProviderId) []const u8 {
+    if (id.* == .configured) return id.label();
+    return label(id.*);
+}
+
 test "auth provider catalog uses the model provider identity and explicit aliases" {
     try std.testing.expectEqual(model_provider.ProviderId.gateway, parse("vercel").?);
     try std.testing.expectEqual(model_provider.ProviderId.gateway, parse("gateway").?);
@@ -82,4 +94,11 @@ test "auth provider catalog uses the model provider identity and explicit aliase
     try std.testing.expect(parse("unknown") == null);
     try std.testing.expect(find(.codex).subscription);
     try std.testing.expect(find(.grok).subscription);
+}
+
+test "configured providers are displayed under their own id" {
+    const glm = model_provider.parse("glm").?;
+    const codex: model_provider.ProviderId = .codex;
+    try std.testing.expectEqualStrings("glm", displayLabel(&glm));
+    try std.testing.expectEqualStrings("Codex subscription", displayLabel(&codex));
 }
