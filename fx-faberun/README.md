@@ -10,6 +10,7 @@ plus a short queue of patches, kept as commits on top of upstream `main`:
 | Keep an fx-faberun build from upgrading itself to the official channel | the stable auto-upgrade would replace fx-faberun and drop its patches | fx-faberun only |
 | Read credentials from `FX_AUTH_HOME` when it is set | Faberun runs each worker under a throwaway HOME, and fx refuses a linked credential file while a copy diverges on the first token refresh | fx-faberun only |
 | List every connection's models in `/model` | the picker only showed the active connection, so reaching GLM, DeepSeek, OpenCode Go or Codex meant restarting with `FX_PROVIDER`. Other connections appear as `connection/model` rows (profile `model_metadata` for configured ones, the live catalog for a signed-in Codex) and choosing one switches to it. A configured connection may set `session_header` (OpenCode Go needs `x-opencode-session`) to receive the fx session id in that header | fx-faberun only |
+| Offer each model's own reasoning levels after choosing it in `/model` | GLM, DeepSeek, Codex and OpenCode Go accept different levels, and fx never sent one to a configured connection. A model lists its levels in `model_metadata.<id>.reasoning_efforts`, either by name (sent as `reasoning_effort`) or as `{"name": "off", "body": {"thinking": {"type": "disabled"}}}` with its own request fields. Levels a service reports in its `/models` (DeepSeek's `effort.supported_levels`) are added after the declared ones when the picker opens | fx-faberun only |
 
 ## Install
 

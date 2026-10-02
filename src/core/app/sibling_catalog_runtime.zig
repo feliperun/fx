@@ -1,7 +1,9 @@
 //! Feeds the /model picker with the models of every connection that is not the
-//! active one. A configured connection answers from its profile settings on the
-//! calling thread. The Codex subscription needs a signed-in catalog fetch, so it
-//! runs on one background thread and lands in the cache when it finishes.
+//! active one. When the active connection changes, configured connections are
+//! listed at once from their profile settings. A background pass then refreshes
+//! them with the reasoning levels each service reports for its models, and
+//! fetches the signed-in Codex catalog, so the effort step after choosing a row
+//! offers that model's own levels.
 //!
 //! Rows reach the picker as `connection/model` (see `model_cache_runtime`), and
 //! choosing one switches connection through the same path as `/model`.
@@ -21,7 +23,10 @@ const provider_set = @import("../gateway/provider_set.zig");
 const Allocator = std.mem.Allocator;
 
 const codex_connection = "codex";
-const codex_refresh_interval_ms: i64 = 5 * 60 * 1000;
+const refresh_interval_ms: i64 = 5 * 60 * 1000;
+/// Any non-empty endpoint asks a configured catalog to read the service's own
+/// model list (see `chat_completions.discover_efforts`).
+const discovery_endpoint = "/models";
 
 pub const Runtime = struct {
     const Self = @This();
@@ -30,9 +35,12 @@ pub const Runtime = struct {
     thread: ?std.Thread = null,
     done: std.atomic.Value(bool) = .init(true),
     cancel_requested: std.atomic.Value(bool) = .init(false),
-    /// Zero until a fetch has been started; throttles the refresh to one per
+    /// Zero until a background pass has started; throttles it to one per
     /// interval so opening the picker repeatedly does not hit the network.
-    codex_started_ms: i64 = 0,
+    started_ms: i64 = 0,
+    /// The connection the rows were last computed for. A change relists the
+    /// configured connections at once and asks for a fresh background pass.
+    last_active: ?model_provider.ProviderId = null,
 
     pub fn init(alloc: Allocator) Self {
         return .{ .alloc = alloc };
@@ -54,19 +62,26 @@ pub const Runtime = struct {
         transport: oauth_transport.Provider,
         secret_store: host.SecretStore,
         host_managed: bool,
+        /// False at launch: the background pass is network work for a picker
+        /// that may never open, so it waits until one does.
+        reach_network: bool,
     ) void {
         self.finishThreadIfDone();
-        self.refreshConfigured(cache, set, active);
-        if (active == .codex) {
-            cache.replaceSiblings(codex_connection, .empty) catch {};
-            self.codex_started_ms = 0;
-            return;
+        // The Gateway already prefixes ids with the publisher, so only the
+        // other routes get their connection label in front.
+        cache.setActiveConnection(if (active == .gateway) null else active.label());
+        const changed = if (self.last_active) |last| !last.eql(active) else true;
+        if (changed) {
+            self.last_active = active;
+            self.listDeclared(cache, set, active);
+            if (active == .codex) cache.replaceSiblings(codex_connection, .empty) catch {};
+            self.started_ms = 0;
         }
-        if (host_managed) return;
-        self.startCodex(cache, set, transport, secret_store);
+        if (reach_network) self.startBackground(cache, set, active, transport, secret_store, host_managed);
     }
 
-    fn refreshConfigured(
+    /// Profile-declared models only, without touching the network.
+    fn listDeclared(
         self: *Self,
         cache: *model_cache_runtime.Runtime,
         set: provider_set.Set,
@@ -74,8 +89,7 @@ pub const Runtime = struct {
     ) void {
         const factory = set.configured_fn orelse return;
         for (set.definitions) |*definition| {
-            const is_active = active == .configured and std.mem.eql(u8, active.label(), definition.id);
-            if (is_active) {
+            if (isActive(active, definition.id)) {
                 cache.replaceSiblings(definition.id, .empty) catch {};
                 continue;
             }
@@ -91,34 +105,60 @@ pub const Runtime = struct {
         }
     }
 
-    fn startCodex(
+    fn startBackground(
         self: *Self,
         cache: *model_cache_runtime.Runtime,
         set: provider_set.Set,
+        active: model_provider.ProviderId,
         transport: oauth_transport.Provider,
         secret_store: host.SecretStore,
+        host_managed: bool,
     ) void {
         if (self.thread != null) return;
-        const provider = set.codex.model_catalog orelse return;
         const now = io_mod.milliTimestamp();
-        if (self.codex_started_ms != 0 and now - self.codex_started_ms < codex_refresh_interval_ms) return;
-        self.codex_started_ms = now;
+        if (self.started_ms != 0 and now - self.started_ms < refresh_interval_ms) return;
+        var work = Work.init(self.alloc, set, active, transport, secret_store, host_managed) catch return;
+        if (work.isEmpty()) {
+            work.deinit(self.alloc);
+            return;
+        }
+        self.started_ms = now;
         self.done.store(false, .release);
-        self.thread = std.Thread.spawn(.{}, codexMain, .{ self, cache, provider, transport, secret_store }) catch {
+        self.thread = std.Thread.spawn(.{}, backgroundMain, .{ self, cache, work }) catch {
+            work.deinit(self.alloc);
             self.done.store(true, .release);
-            self.codex_started_ms = 0;
+            self.started_ms = 0;
             return;
         };
     }
 
-    fn codexMain(
+    fn backgroundMain(self: *Self, cache: *model_cache_runtime.Runtime, work: Work) void {
+        defer self.done.store(true, .release);
+        var owned = work;
+        defer owned.deinit(self.alloc);
+        if (owned.factory) |factory| for (owned.definitions) |*definition| {
+            if (self.cancel_requested.load(.seq_cst)) return;
+            const provider = factory(definition).model_catalog orelse continue;
+            const result = provider.fetch(self.alloc, .{
+                .access = .{ .public_only = .no_credential },
+                .endpoint = discovery_endpoint,
+                .cancel_flag = &self.cancel_requested,
+            }) catch continue;
+            switch (result) {
+                .catalog => |entries| cache.replaceSiblings(definition.id, entries) catch {},
+                .failure => {},
+            }
+        };
+        if (owned.codex) |provider| self.fetchCodex(cache, provider, owned.transport, owned.secret_store);
+    }
+
+    fn fetchCodex(
         self: *Self,
         cache: *model_cache_runtime.Runtime,
         provider: model_catalog.Provider,
         transport: oauth_transport.Provider,
         secret_store: host.SecretStore,
     ) void {
-        defer self.done.store(true, .release);
         const signed_in = chatgpt_oauth.sourceExists(self.alloc) catch false;
         if (!signed_in or self.cancel_requested.load(.seq_cst)) return;
         var credential = (auth_runtime.prepareCredential(
@@ -143,7 +183,7 @@ pub const Runtime = struct {
         }) catch return;
         switch (result) {
             .catalog => |entries| cache.replaceSiblings(codex_connection, entries) catch {},
-            .failure => self.codex_started_ms = 0,
+            .failure => {},
         }
     }
 
@@ -155,6 +195,60 @@ pub const Runtime = struct {
         const thread = self.thread orelse return;
         thread.join();
         self.thread = null;
+    }
+};
+
+fn isActive(active: model_provider.ProviderId, connection: []const u8) bool {
+    return active == .configured and std.mem.eql(u8, active.label(), connection);
+}
+
+/// What one background pass needs, copied so it outlives a settings reload
+/// that replaces the profile's definitions.
+const Work = struct {
+    definitions: []configured_provider.Definition,
+    factory: ?*const fn (*const configured_provider.Definition) provider_set.Bundle,
+    codex: ?model_catalog.Provider,
+    transport: oauth_transport.Provider,
+    secret_store: host.SecretStore,
+
+    fn init(
+        alloc: Allocator,
+        set: provider_set.Set,
+        active: model_provider.ProviderId,
+        transport: oauth_transport.Provider,
+        secret_store: host.SecretStore,
+        host_managed: bool,
+    ) Allocator.Error!Work {
+        var definitions: std.ArrayList(configured_provider.Definition) = .empty;
+        errdefer {
+            for (definitions.items) |definition| definition.deinit(alloc);
+            definitions.deinit(alloc);
+        }
+        if (set.configured_fn != null) for (set.definitions) |definition| {
+            if (isActive(active, definition.id)) continue;
+            const copy = try definition.clone(alloc);
+            definitions.append(alloc, copy) catch |err| {
+                copy.deinit(alloc);
+                return err;
+            };
+        };
+        return .{
+            .definitions = try definitions.toOwnedSlice(alloc),
+            .factory = set.configured_fn,
+            .codex = if (active == .codex or host_managed) null else set.codex.model_catalog,
+            .transport = transport,
+            .secret_store = secret_store,
+        };
+    }
+
+    fn isEmpty(self: Work) bool {
+        return self.definitions.len == 0 and self.codex == null;
+    }
+
+    fn deinit(self: *Work, alloc: Allocator) void {
+        for (self.definitions) |definition| definition.deinit(alloc);
+        alloc.free(self.definitions);
+        self.* = undefined;
     }
 };
 
@@ -184,12 +278,12 @@ test "configured connections other than the active one become picker rows" {
         .configured_fn = @import("../../gateway/chat_completions.zig").bundle,
     };
 
-    runtime.refresh(&cache, set, model_provider.parse("deepseek").?, oauth_transport.unavailable_provider, host.unavailable_secret_store, true);
+    runtime.refresh(&cache, set, model_provider.parse("deepseek").?, oauth_transport.unavailable_provider, host.unavailable_secret_store, true, false);
     try std.testing.expectEqual(@as(usize, 2), cache.siblings.items.len);
     try std.testing.expectEqualStrings("glm/glm-5.3", cache.siblings.items[0].id);
 
     // Switching to glm swaps which connection is listed.
-    runtime.refresh(&cache, set, model_provider.parse("glm").?, oauth_transport.unavailable_provider, host.unavailable_secret_store, true);
+    runtime.refresh(&cache, set, model_provider.parse("glm").?, oauth_transport.unavailable_provider, host.unavailable_secret_store, true, false);
     try std.testing.expectEqual(@as(usize, 1), cache.siblings.items.len);
     try std.testing.expectEqualStrings("deepseek/deepseek-flash", cache.siblings.items[0].id);
 }
