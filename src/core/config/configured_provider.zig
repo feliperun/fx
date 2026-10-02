@@ -24,6 +24,7 @@ pub const ParseError = Allocator.Error || error{
     InvalidAuth,
     InvalidEnvironmentName,
     InvalidToolChoiceMode,
+    InvalidSessionHeader,
     InvalidModelId,
     InvalidModelMetadata,
 };
@@ -55,6 +56,9 @@ pub const Definition = struct {
     auth: Auth,
     tool_choice_mode: ToolChoiceMode = .omit,
     reviewer_model: ?[]const u8 = null,
+    /// Name of a request header that carries the fx session id, for services
+    /// that refuse a request without one (OpenCode Go wants `x-opencode-session`).
+    session_header: ?[]const u8 = null,
     model_metadata: []const ModelMetadata = &.{},
 
     /// Caller owns the returned URL. base_url is already a validated API prefix.
@@ -85,6 +89,9 @@ pub const Definition = struct {
             .none => {},
             .bearer => |env| hash_part(&hash, env),
         }
+        // Only hashed when set, so a definition without it keeps the identity
+        // that saved sessions were bound to.
+        if (self.session_header) |name| hash_part(&hash, name);
         return hash.finalResult();
     }
 
@@ -96,6 +103,7 @@ pub const Definition = struct {
             .bearer => |env| alloc.free(env),
         }
         if (self.reviewer_model) |id| alloc.free(id);
+        if (self.session_header) |name| alloc.free(name);
         for (self.model_metadata) |metadata| alloc.free(metadata.id);
         alloc.free(self.model_metadata);
     }
@@ -163,7 +171,7 @@ pub const Registry = struct {
 
 fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) ParseError!Definition {
     try validate_id(id);
-    try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "reviewer_model", "model_metadata" });
+    try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "reviewer_model", "session_header", "model_metadata" });
     const protocol = try required(value, "protocol");
     if (protocol != .string or !std.mem.eql(u8, protocol.string, "openai-chat-completions")) return error.InvalidProtocol;
     const url = try required(value, "base_url");
@@ -182,6 +190,13 @@ fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) Par
         reviewer = model_value.string;
     }
 
+    var session_header: ?[]const u8 = null;
+    if (value.object.get("session_header")) |header| {
+        if (header != .string) return error.InvalidSessionHeader;
+        try validate_session_header(header.string);
+        session_header = header.string;
+    }
+
     const owned_id = try alloc.dupe(u8, id);
     errdefer alloc.free(owned_id);
     const owned_url = try alloc.dupe(u8, normalized);
@@ -196,6 +211,8 @@ fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) Par
     };
     const owned_reviewer = if (reviewer) |model_id| try alloc.dupe(u8, model_id) else null;
     errdefer if (owned_reviewer) |model_id| alloc.free(model_id);
+    const owned_session_header = if (session_header) |name| try alloc.dupe(u8, name) else null;
+    errdefer if (owned_session_header) |name| alloc.free(name);
     return .{
         .id = owned_id,
         .protocol = .@"openai-chat-completions",
@@ -203,8 +220,20 @@ fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) Par
         .auth = owned_auth,
         .tool_choice_mode = mode,
         .reviewer_model = owned_reviewer,
+        .session_header = owned_session_header,
         .model_metadata = if (value.object.get("model_metadata")) |metadata| try parse_metadata(alloc, metadata) else &.{},
     };
+}
+
+/// A header token the client does not already own: the credential, the stream
+/// negotiation and the framing headers must stay out of configuration's reach.
+fn validate_session_header(name: []const u8) ParseError!void {
+    if (name.len == 0 or name.len > 64) return error.InvalidSessionHeader;
+    for (name) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '-') return error.InvalidSessionHeader;
+    }
+    const reserved = [_][]const u8{ "authorization", "accept", "host", "content-type", "content-length", "transfer-encoding", "connection" };
+    for (reserved) |blocked| if (std.ascii.eqlIgnoreCase(name, blocked)) return error.InvalidSessionHeader;
 }
 
 fn parse_auth(value: std.json.Value) ParseError!Auth {
@@ -475,6 +504,18 @@ test "configured provider allocation failures release partial registry and URLs"
 
 const test_required_fields = "\"protocol\":\"openai-chat-completions\",\"base_url\":\"https://example.com/v1\",\"auth\":{\"type\":\"none\"}";
 
+test "configured provider session header is optional and keeps existing identities" {
+    const alloc = std.testing.allocator;
+    var plain = try Registry.parse_json(alloc, "{\"local\":{" ++ test_required_fields ++ "}}");
+    defer plain.deinit(alloc);
+    var with_header = try Registry.parse_json(alloc, "{\"local\":{" ++ test_required_fields ++ ",\"session_header\":\"x-opencode-session\"}}");
+    defer with_header.deinit(alloc);
+
+    try std.testing.expect(plain.get("local").?.session_header == null);
+    try std.testing.expectEqualStrings("x-opencode-session", with_header.get("local").?.session_header.?);
+    try std.testing.expect(!std.mem.eql(u8, &plain.get("local").?.binding_identity(), &with_header.get("local").?.binding_identity()));
+}
+
 test "configured provider invalid schemas fail explicitly" {
     const cases = [_]struct { json: []const u8, err: ParseError }{
         .{ .json = "{", .err = error.InvalidJson },
@@ -496,6 +537,12 @@ test "configured provider invalid schemas fail explicitly" {
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"secret\":\"not-allowed\"}}", .err = error.UnknownField },
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"tool_choice_mode\":\"auto\"}}", .err = error.InvalidToolChoiceMode },
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"tool_choice_mode\":null}}", .err = error.InvalidToolChoiceMode },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"session_header\":null}}", .err = error.InvalidSessionHeader },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"session_header\":\"\"}}", .err = error.InvalidSessionHeader },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"session_header\":\"bad header\"}}", .err = error.InvalidSessionHeader },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"session_header\":\"Authorization\"}}", .err = error.InvalidSessionHeader },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"session_header\":\"accept\"}}", .err = error.InvalidSessionHeader },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"session_header\":\"x\\ny\"}}", .err = error.InvalidSessionHeader },
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"reviewer_model\":null}}", .err = error.InvalidModelId },
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"reviewer_model\":\"\"}}", .err = error.InvalidModelId },
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"reviewer_model\":\"bad\\nmodel\"}}", .err = error.InvalidModelId },

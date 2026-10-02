@@ -294,6 +294,10 @@ pub const Runtime = struct {
     alloc: Allocator,
     models_path: []const u8,
     catalog: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty,
+    /// Models of the connections that are not the active one, ids already
+    /// qualified as `connection/model`. They only feed the picker: requests and
+    /// completions keep resolving against `catalog`, the active connection.
+    siblings: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty,
     mutex: std.Io.Mutex = .init,
     thread: ?std.Thread = null,
     state: ModelCacheState = .idle,
@@ -316,6 +320,42 @@ pub const Runtime = struct {
         self.cancelAndJoin();
         self.menu.deinit(self.alloc);
         model_catalog.freeModelCatalog(self.alloc, &self.catalog);
+        model_catalog.freeModelCatalog(self.alloc, &self.siblings);
+    }
+
+    /// Replaces every sibling row of `connection` with `entries`, whose ids are
+    /// bare model ids. Takes ownership of `entries` and its contents. An empty
+    /// list removes the connection from the picker.
+    pub fn replaceSiblings(
+        self: *Self,
+        connection: []const u8,
+        entries: std.ArrayList(model_catalog.ModelCatalogEntry),
+    ) !void {
+        var incoming = entries;
+        errdefer model_catalog.freeModelCatalog(self.alloc, &incoming);
+        for (incoming.items) |*entry| {
+            const qualified = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ connection, entry.id });
+            self.alloc.free(entry.id);
+            entry.id = qualified;
+        }
+
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        var kept: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty;
+        errdefer kept.deinit(self.alloc);
+        try kept.ensureTotalCapacity(self.alloc, self.siblings.items.len + incoming.items.len);
+        for (self.siblings.items) |entry| {
+            if (hasConnection(entry.id, connection)) {
+                model_catalog.freeModelCatalogEntry(self.alloc, entry);
+            } else {
+                kept.appendAssumeCapacity(entry);
+            }
+        }
+        kept.appendSliceAssumeCapacity(incoming.items);
+        incoming.deinit(self.alloc);
+        self.siblings.deinit(self.alloc);
+        self.siblings = kept;
+        self.completion_pending = true;
     }
 
     pub fn startWarmup(
@@ -800,7 +840,7 @@ pub const Runtime = struct {
                 menu.clearSnapshot(self.alloc);
                 menu.load_state = .failed;
             },
-            .ready => try hydrateMenuSnapshot(self.alloc, menu, self.catalog.items),
+            .ready => try hydrateMenuSnapshot(self.alloc, menu, self.catalog.items, self.siblings.items),
         }
         menu.catalog_state = modelMenuCatalogState(self.outcome, self.from_profile_settings);
     }
@@ -839,35 +879,43 @@ fn modelMenuCatalogState(outcome: CatalogOutcome, from_profile_settings: bool) M
     };
 }
 
+fn hasConnection(id: []const u8, connection: []const u8) bool {
+    return id.len > connection.len and id[connection.len] == '/' and
+        std.mem.eql(u8, id[0..connection.len], connection);
+}
+
 fn hydrateMenuSnapshot(
     alloc: Allocator,
     menu: *ModelMenu,
     catalog: []const model_catalog.ModelCatalogEntry,
+    siblings: []const model_catalog.ModelCatalogEntry,
 ) !void {
     var items: std.ArrayList(ModelMenuItem) = .empty;
     errdefer {
         for (items.items) |item| item.deinit(alloc);
         items.deinit(alloc);
     }
-    try items.ensureTotalCapacity(alloc, catalog.len);
+    try items.ensureTotalCapacity(alloc, catalog.len + siblings.len);
 
-    for (catalog) |entry| {
-        const item = item: {
-            const id = try alloc.dupe(u8, entry.id);
-            errdefer alloc.free(id);
-            break :item ModelMenuItem{
-                .id = id,
-                .provider = modelProvider(id),
-                .capabilities = model_capabilities.resolveCapabilities(
-                    id,
-                    model_catalog_metadata.fromCatalogEntry(entry),
-                ),
+    for ([_][]const model_catalog.ModelCatalogEntry{ catalog, siblings }) |source| {
+        for (source) |entry| {
+            const item = item: {
+                const id = try alloc.dupe(u8, entry.id);
+                errdefer alloc.free(id);
+                break :item ModelMenuItem{
+                    .id = id,
+                    .provider = modelProvider(id),
+                    .capabilities = model_capabilities.resolveCapabilities(
+                        id,
+                        model_catalog_metadata.fromCatalogEntry(entry),
+                    ),
+                };
             };
-        };
-        items.append(alloc, item) catch |err| {
-            item.deinit(alloc);
-            return err;
-        };
+            items.append(alloc, item) catch |err| {
+                item.deinit(alloc);
+                return err;
+            };
+        }
     }
 
     menu.clearSnapshot(alloc);
@@ -886,6 +934,53 @@ fn findCatalogModel(catalog: []const model_catalog.ModelCatalogEntry, model: []c
         if (std.mem.eql(u8, entry.id, model)) return entry;
     }
     return null;
+}
+
+fn testSiblingEntries(alloc: Allocator, ids: []const []const u8) !std.ArrayList(model_catalog.ModelCatalogEntry) {
+    var entries: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty;
+    errdefer model_catalog.freeModelCatalog(alloc, &entries);
+    for (ids) |id| {
+        const owned_id = try alloc.dupe(u8, id);
+        errdefer alloc.free(owned_id);
+        const model_type = try alloc.dupe(u8, "language");
+        errdefer alloc.free(model_type);
+        try entries.append(alloc, .{ .id = owned_id, .model_type = model_type });
+    }
+    return entries;
+}
+
+test "picker lists other connections as connection/model rows" {
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc, "/v1/models");
+    defer runtime.deinit();
+    runtime.catalog = try testSiblingEntries(alloc, &.{"deepseek-flash"});
+    runtime.state = .ready;
+
+    try runtime.replaceSiblings("glm", try testSiblingEntries(alloc, &.{ "glm-5.3", "glm-5.3-flash" }));
+    try runtime.replaceSiblings("opencode-go", try testSiblingEntries(alloc, &.{"glm-5.3"}));
+    try runtime.openMenu();
+
+    try std.testing.expectEqual(@as(usize, 4), runtime.menu.filteredItemCount());
+    try std.testing.expectEqualStrings("deepseek-flash", runtime.menu.itemAt(0).?.id);
+    try std.testing.expectEqualStrings("glm/glm-5.3", runtime.menu.itemAt(1).?.id);
+    try std.testing.expectEqualStrings("glm", runtime.menu.itemAt(1).?.provider);
+    try std.testing.expectEqualStrings("opencode-go/glm-5.3", runtime.menu.itemAt(3).?.id);
+    runtime.menu.setQuery("opencode-go");
+    try std.testing.expectEqual(@as(usize, 1), runtime.menu.filteredItemCount());
+
+    // A refresh replaces only its own connection; an empty list removes it.
+    try runtime.replaceSiblings("glm", try testSiblingEntries(alloc, &.{"glm-5.4"}));
+    try runtime.replaceSiblings("opencode-go", .empty);
+    try runtime.openMenu();
+    try std.testing.expectEqual(@as(usize, 2), runtime.menu.filteredItemCount());
+    try std.testing.expectEqualStrings("glm/glm-5.4", runtime.menu.itemAt(1).?.id);
+
+    // `glm-x` is not a row of the `glm` connection.
+    try runtime.replaceSiblings("glm-x", try testSiblingEntries(alloc, &.{"m"}));
+    try runtime.replaceSiblings("glm", .empty);
+    try runtime.openMenu();
+    try std.testing.expectEqual(@as(usize, 2), runtime.menu.filteredItemCount());
+    try std.testing.expectEqualStrings("glm-x/m", runtime.menu.itemAt(1).?.id);
 }
 
 var stable_test_environ: ?*std.process.Environ.Map = null;
@@ -1469,7 +1564,7 @@ test "model menu owns resolved catalog state and filters without changing catalo
         },
     };
     runtime.state = .ready;
-    try hydrateMenuSnapshot(alloc, &runtime.menu, &entries);
+    try hydrateMenuSnapshot(alloc, &runtime.menu, &entries, &.{});
     runtime.menu.active = true;
 
     try std.testing.expectEqual(ModelMenuLoadState.ready, runtime.menu.load_state);
@@ -1517,7 +1612,7 @@ test "model menu provider navigation skips absent and redundant filters" {
     };
     var mixed: ModelMenu = .{};
     defer mixed.deinit(alloc);
-    try hydrateMenuSnapshot(alloc, &mixed, &mixed_entries);
+    try hydrateMenuSnapshot(alloc, &mixed, &mixed_entries, &.{});
     mixed.active = true;
 
     try std.testing.expect(mixed.moveProvider(1));
@@ -1533,7 +1628,7 @@ test "model menu provider navigation skips absent and redundant filters" {
     };
     var codex: ModelMenu = .{};
     defer codex.deinit(alloc);
-    try hydrateMenuSnapshot(alloc, &codex, &codex_entries);
+    try hydrateMenuSnapshot(alloc, &codex, &codex_entries, &.{});
     codex.active = true;
 
     try std.testing.expect(!codex.moveProvider(1));
@@ -1549,14 +1644,14 @@ test "model menu snapshot construction cleans every allocation failure" {
 
     var probe = std.testing.FailingAllocator.init(backing, .{});
     var menu: ModelMenu = .{};
-    try hydrateMenuSnapshot(probe.allocator(), &menu, &entries);
+    try hydrateMenuSnapshot(probe.allocator(), &menu, &entries, &.{});
     menu.deinit(probe.allocator());
     try std.testing.expectEqual(probe.allocated_bytes, probe.freed_bytes);
 
     for (0..probe.alloc_index) |fail_index| {
         var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = fail_index });
         var failed_menu: ModelMenu = .{};
-        if (hydrateMenuSnapshot(failing.allocator(), &failed_menu, &entries)) {
+        if (hydrateMenuSnapshot(failing.allocator(), &failed_menu, &entries, &.{})) {
             failed_menu.deinit(failing.allocator());
         } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
         try std.testing.expect(failing.has_induced_failure);
