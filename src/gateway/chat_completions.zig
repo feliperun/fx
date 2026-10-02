@@ -48,7 +48,30 @@ fn build(raw: ?*anyopaque, alloc: Allocator, request: streams.RequestData) ![]u8
             break;
         }
     };
-    return codec.build_request(alloc, request, .{ .tool_choice_mode = definition.tool_choice_mode, .provider = &identity });
+    return codec.build_request(alloc, request, .{
+        .tool_choice_mode = definition.tool_choice_mode,
+        .provider = &identity,
+        .effort = request_effort(definition, &request),
+    });
+}
+
+/// The wire form of the requested reasoning level. A level the profile
+/// declared carries its own fields; one learned from the service's model list
+/// goes out as `reasoning_effort`. Capability resolution only lets a level
+/// through when the model offers it, so null here means none was requested.
+///
+/// Takes the request by pointer: the level's name borrows the effort's inline
+/// bytes, which must outlive serialization.
+fn request_effort(definition: *const definitions.Definition, request: *const streams.RequestData) ?codec.Effort {
+    const requested = if (request.provider_options.reasoning) |*value| value else return null;
+    const name = switch (requested.*) {
+        .auto => return null,
+        .named => requested.label(),
+    };
+    if (definition.model(request.model)) |metadata| {
+        if (metadata.effort(name)) |option| return .{ .name = option.name, .members = option.bodyMembers() };
+    }
+    return .{ .name = name };
 }
 
 fn project_replay(alloc: Allocator, replay: ?types.ProviderReplay, calls: []const types.ToolCall, text: bool, reasoning: bool) !?types.ProviderReplay {
@@ -225,7 +248,22 @@ fn metadata_entry(metadata: definitions.ModelMetadata) catalog.ModelCatalogEntry
 
 fn lookup_capabilities(raw: ?*anyopaque, model: []const u8) model_capabilities.Capabilities {
     const metadata = definition_at(raw).model(model) orelse return .{};
-    return model_capabilities.mergeCapabilities(.{}, model_catalog_metadata.fromCatalogEntry(metadata_entry(metadata.*)));
+    var gateway_metadata = model_catalog_metadata.fromCatalogEntry(metadata_entry(metadata.*));
+    gateway_metadata.reasoning_efforts = metadata_efforts(metadata.*);
+    gateway_metadata.supports_reasoning = gateway_metadata.reasoning_efforts.len > 0;
+    return model_capabilities.mergeCapabilities(.{}, gateway_metadata);
+}
+
+/// The levels a profile declared for this model, as fx's effort values. A name
+/// fx cannot represent is skipped rather than failing the whole catalog.
+fn metadata_efforts(metadata: definitions.ModelMetadata) model_capabilities.ReasoningEffortOptions {
+    var levels: model_capabilities.ReasoningEffortOptions = .{};
+    for (metadata.reasoning_efforts) |option| {
+        if (levels.len == levels.values.len) break;
+        levels.values[levels.len] = types.ReasoningEffort.parse(option.name) orelse continue;
+        levels.len += 1;
+    }
+    return levels;
 }
 
 fn fetch_catalog(raw: ?*anyopaque, alloc: Allocator, input: catalog.FetchInput) Allocator.Error!catalog.ProviderResult {
@@ -239,10 +277,138 @@ fn fetch_catalog(raw: ?*anyopaque, alloc: Allocator, input: catalog.FetchInput) 
         errdefer alloc.free(entry.id);
         entry.model_type = try alloc.dupe(u8, entry.model_type);
         errdefer alloc.free(entry.model_type);
+        const levels = metadata_efforts(metadata);
+        try entry.reasoning_efforts.appendSlice(alloc, levels.slice());
+        errdefer entry.reasoning_efforts.deinit(alloc);
+        entry.has_reasoning = levels.len > 0;
         try entries.append(alloc, entry);
     }
+    try discover_efforts(alloc, definition, input, &entries);
     return .{ .catalog = entries };
 }
+
+const discovery_timeout_ms: i64 = 10_000;
+const max_discovery_bytes: usize = 4 * 1024 * 1024;
+
+/// Adds the reasoning levels the service itself lists for each model, after
+/// the ones the profile declared. DeepSeek reports them under
+/// `effort.supported_levels` in `/models`; a service that reports none, or a
+/// failed request, leaves the declared levels as they are.
+///
+/// Runs only when the caller names an endpoint: the picker's synchronous
+/// refresh passes none, so it never waits on the network.
+fn discover_efforts(
+    alloc: Allocator,
+    definition: *const definitions.Definition,
+    input: catalog.FetchInput,
+    entries: *std.ArrayList(catalog.ModelCatalogEntry),
+) Allocator.Error!void {
+    if (input.endpoint.len == 0 or entries.items.len == 0) return;
+    // The same environment slot the stream credential is read from.
+    const token: ?[]const u8 = switch (definition.auth) {
+        .none => null,
+        .bearer => |env| io.getenv(env) orelse return,
+    };
+    const url = try std.mem.concat(alloc, u8, &.{ definition.base_url, "/models" });
+    defer alloc.free(url);
+    var fallback_cancel = std.atomic.Value(bool).init(false);
+    const deadline = std.Io.Clock.Timestamp.fromNow(io.getIo(), .{ .clock = .awake, .raw = .fromMilliseconds(discovery_timeout_ms) });
+    var operation = ModelsRequest{ .alloc = alloc, .url = url, .token = token };
+    var response = client_mod.runBoundedHttpOperation(ModelsResponse, alloc, input.cancel_flag orelse &fallback_cancel, deadline, &operation) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        debug_trace.logf("gateway", "effort_discovery_failed provider={s} err={s}", .{ definition.id, @errorName(err) });
+        return;
+    };
+    defer response.deinit(alloc);
+    if (response.status != .ok) {
+        debug_trace.logf("gateway", "effort_discovery_failed provider={s} status={d}", .{ definition.id, @intFromEnum(response.status) });
+        return;
+    }
+    try merge_discovered_efforts(alloc, response.body, entries.items);
+}
+
+fn merge_discovered_efforts(alloc: Allocator, body: []const u8, entries: []catalog.ModelCatalogEntry) Allocator.Error!void {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return;
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return;
+    const data = parsed.value.object.get("data") orelse return;
+    if (data != .array) return;
+    for (data.array.items) |model| {
+        if (model != .object) continue;
+        const id = model.object.get("id") orelse continue;
+        const effort = model.object.get("effort") orelse continue;
+        if (id != .string or effort != .object) continue;
+        const levels = effort.object.get("supported_levels") orelse continue;
+        if (levels != .array) continue;
+        for (entries) |*entry| {
+            if (!std.mem.eql(u8, entry.id, id.string)) continue;
+            for (levels.array.items) |level| {
+                if (level != .string) continue;
+                const value = types.ReasoningEffort.parse(level.string) orelse continue;
+                if (value == .auto or has_effort(entry.reasoning_efforts.items, value)) continue;
+                if (entry.reasoning_efforts.items.len >= types.ReasoningEffort.max_options) break;
+                try entry.reasoning_efforts.append(alloc, value);
+            }
+            entry.has_reasoning = entry.reasoning_efforts.items.len > 0;
+        }
+    }
+}
+
+fn has_effort(levels: []const types.ReasoningEffort, value: types.ReasoningEffort) bool {
+    for (levels) |level| if (level.eql(value)) return true;
+    return false;
+}
+
+const ModelsResponse = struct {
+    status: std.http.Status,
+    body: []u8,
+
+    pub fn deinit(self: *ModelsResponse, alloc: Allocator) void {
+        alloc.free(self.body);
+        self.* = undefined;
+    }
+};
+
+const ModelsRequest = struct {
+    alloc: Allocator,
+    url: []const u8,
+    token: ?[]const u8,
+
+    pub fn run(self: *@This()) !ModelsResponse {
+        var client: std.http.Client = .{ .allocator = self.alloc, .io = io.getIo() };
+        defer client.deinit();
+        var authorization: ?[]u8 = null;
+        defer if (authorization) |value| secret.zeroAndFree(self.alloc, value);
+        var headers: std.http.Client.Request.Headers = .{
+            .user_agent = .{ .override = client_mod.user_agent },
+            .accept_encoding = .omit,
+        };
+        if (self.token) |token| {
+            authorization = try std.fmt.allocPrint(self.alloc, "Bearer {s}", .{token});
+            headers.authorization = .{ .override = authorization.? };
+        }
+        const buffer = try self.alloc.alloc(u8, max_discovery_bytes + 1);
+        defer self.alloc.free(buffer);
+        var writer = std.Io.Writer.fixed(buffer);
+        const result = client.fetch(.{
+            .location = .{ .url = self.url },
+            .method = .GET,
+            .headers = headers,
+            .extra_headers = &.{.{ .name = "accept", .value = "application/json" }},
+            .response_writer = &writer,
+            .redirect_behavior = .unhandled,
+        }) catch |err| switch (err) {
+            error.WriteFailed => return error.ModelListTooLarge,
+            else => return err,
+        };
+        const body = writer.buffered();
+        if (body.len > max_discovery_bytes) return error.ModelListTooLarge;
+        return .{ .status = result.status, .body = try self.alloc.dupe(u8, body) };
+    }
+};
 
 test "configured capability lookup matches catalog projection and preserves unknowns" {
     const alloc = std.testing.allocator;
@@ -251,7 +417,7 @@ test "configured capability lookup matches catalog projection and preserves unkn
     );
     defer registry.deinit(alloc);
     const provider = bundle(registry.get("local").?).model_catalog.?;
-    var fetched = try provider.fetch(alloc, .{ .endpoint = "unused" });
+    var fetched = try provider.fetch(alloc, .{ .endpoint = "" });
     defer catalog.freeModelCatalog(alloc, &fetched.catalog);
     for (fetched.catalog.items) |entry| {
         const actual = provider.lookupCapabilities(entry.id).?;
@@ -339,4 +505,74 @@ fn send_review(raw: *anyopaque, alloc: Allocator, model: []const u8, payload: []
     const owned = try alloc.create(streams.Result);
     owned.* = result;
     return .{ .completion = .{ .completion = owned.completed.completion, .context = owned, .deinit_fn = free_result } };
+}
+
+test "configured reasoning levels reach the effort step and the request body" {
+    const alloc = std.testing.allocator;
+    var registry = try definitions.Registry.parse_json(alloc,
+        \\{"deepseek":{"protocol":"openai-chat-completions","base_url":"https://api.deepseek.com","auth":{"type":"none"},
+        \\"model_metadata":{"deepseek-flash":{"reasoning_efforts":[{"name":"off","body":{"thinking":{"type":"disabled"}}},"low"]},"plain":{}}}}
+    );
+    defer registry.deinit(alloc);
+    const definition = registry.get("deepseek").?;
+    const provider = bundle(definition).model_catalog.?;
+
+    // Declared levels keep their order, lowest first, for the picker's effort step.
+    const capabilities = provider.lookupCapabilities("deepseek-flash").?;
+    try std.testing.expect(capabilities.supports_reasoning);
+    try std.testing.expectEqual(@as(usize, 2), capabilities.reasoning_efforts.len);
+    try std.testing.expectEqualStrings("off", capabilities.reasoning_efforts.values[0].label());
+    try std.testing.expectEqual(@as(usize, 0), provider.lookupCapabilities("plain").?.reasoning_efforts.len);
+
+    const messages = [_]types.ChatMessage{.{ .role = .user, .content = "hi" }};
+    const cases = [_]struct { effort: ?types.ReasoningEffort, model: []const u8, expected: ?[]const u8 }{
+        .{ .effort = types.ReasoningEffort.literal("off"), .model = "deepseek-flash", .expected = "\"thinking\":{\"type\":\"disabled\"}" },
+        .{ .effort = types.ReasoningEffort.literal("low"), .model = "deepseek-flash", .expected = "\"reasoning_effort\":\"low\"" },
+        // A level learned from the service's model list goes out by name.
+        .{ .effort = types.ReasoningEffort.literal("max"), .model = "deepseek-flash", .expected = "\"reasoning_effort\":\"max\"" },
+        .{ .effort = null, .model = "deepseek-flash", .expected = null },
+    };
+    for (cases) |case| {
+        const body = try build(@ptrCast(@constCast(definition)), alloc, .{
+            .model = case.model,
+            .messages = &messages,
+            .tool_choice = .auto,
+            .provider_options = .{ .reasoning = case.effort },
+        });
+        defer alloc.free(body);
+        if (case.expected) |fragment| {
+            try std.testing.expect(std.mem.find(u8, body, fragment) != null);
+        } else {
+            try std.testing.expect(std.mem.find(u8, body, "reasoning_effort") == null);
+            try std.testing.expect(std.mem.find(u8, body, "thinking") == null);
+        }
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+        parsed.deinit();
+    }
+}
+
+test "levels a service reports are added after the declared ones" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(catalog.ModelCatalogEntry) = .empty;
+    defer catalog.freeModelCatalog(alloc, &entries);
+    for ([_][]const u8{ "deepseek-flash", "undeclared" }) |id| {
+        try entries.append(alloc, .{ .id = try alloc.dupe(u8, id), .model_type = try alloc.dupe(u8, "language") });
+    }
+    try entries.items[0].reasoning_efforts.append(alloc, types.ReasoningEffort.literal("off"));
+    try merge_discovered_efforts(alloc,
+        \\{"object":"list","data":[{"id":"deepseek-flash","effort":{"supported_levels":["low","high","max","off","default"],"default_level":"high"}},
+        \\{"id":"not-listed","effort":{"supported_levels":["low"]}},{"id":"undeclared"},{"id":7}]}
+    , entries.items);
+    const levels = entries.items[0].reasoning_efforts.items;
+    try std.testing.expectEqual(@as(usize, 4), levels.len);
+    for ([_][]const u8{ "off", "low", "high", "max" }, levels) |expected, level| {
+        try std.testing.expectEqualStrings(expected, level.label());
+    }
+    try std.testing.expect(entries.items[0].has_reasoning);
+    try std.testing.expectEqual(@as(usize, 0), entries.items[1].reasoning_efforts.items.len);
+
+    // A body that is not a model list leaves the entries alone.
+    try merge_discovered_efforts(alloc, "not json", entries.items);
+    try merge_discovered_efforts(alloc, "{\"data\":{}}", entries.items);
+    try std.testing.expectEqual(@as(usize, 4), entries.items[0].reasoning_efforts.items.len);
 }

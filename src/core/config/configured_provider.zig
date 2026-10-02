@@ -25,6 +25,7 @@ pub const ParseError = Allocator.Error || error{
     InvalidEnvironmentName,
     InvalidToolChoiceMode,
     InvalidSessionHeader,
+    InvalidReasoningEffort,
     InvalidModelId,
     InvalidModelMetadata,
 };
@@ -39,12 +40,46 @@ pub const Auth = union(enum) {
     bearer: []const u8,
 };
 
+/// One reasoning level a model accepts. Services spell the same idea in
+/// different fields (DeepSeek turns thinking off with `thinking`, but sets its
+/// level with `reasoning_effort`), so each level carries its own wire form.
+pub const EffortOption = struct {
+    /// The level the operator picks; sent as `reasoning_effort` when `body` is null.
+    name: []const u8,
+    /// Serialized JSON object whose members are written into the request body
+    /// instead. Only `reasoning_body_fields` may appear in it.
+    body: ?[]const u8 = null,
+
+    /// Members of `body` without the enclosing braces, ready to splice into a
+    /// request object. Null when the level is sent as `reasoning_effort`.
+    pub fn bodyMembers(self: EffortOption) ?[]const u8 {
+        const object = self.body orelse return null;
+        return object[1 .. object.len - 1];
+    }
+};
+
+/// Request fields a reasoning level may set. Everything else in the body stays
+/// owned by the client, so a profile cannot rewrite the model, the messages or
+/// the tools through an effort level.
+pub const reasoning_body_fields = [_][]const u8{ "reasoning_effort", "thinking", "reasoning", "enable_thinking" };
+const max_effort_options = 16;
+const max_effort_name_bytes = 64;
+
 pub const ModelMetadata = struct {
     id: []const u8,
     context_window: ?u32 = null,
     max_output_tokens: ?u32 = null,
     supports_tool_use: ?bool = null,
     supports_vision: ?bool = null,
+    /// Levels in the order offered, lowest first; empty means none is sent.
+    reasoning_efforts: []const EffortOption = &.{},
+
+    pub fn effort(self: *const ModelMetadata, name: []const u8) ?*const EffortOption {
+        for (self.reasoning_efforts) |*option| {
+            if (std.ascii.eqlIgnoreCase(option.name, name)) return option;
+        }
+        return null;
+    }
 };
 
 /// Registry owns all slices. Treat definitions as immutable while borrowed by
@@ -95,7 +130,66 @@ pub const Definition = struct {
         return hash.finalResult();
     }
 
-    fn deinit(self: Definition, alloc: Allocator) void {
+    /// Deep copy for work that outlives the registry, such as a background
+    /// catalog fetch. Caller owns the result and frees it with `deinit`.
+    pub fn clone(self: Definition, alloc: Allocator) Allocator.Error!Definition {
+        const id = try alloc.dupe(u8, self.id);
+        errdefer alloc.free(id);
+        const base_url = try alloc.dupe(u8, self.base_url);
+        errdefer alloc.free(base_url);
+        const auth: Auth = switch (self.auth) {
+            .none => .none,
+            .bearer => |env| .{ .bearer = try alloc.dupe(u8, env) },
+        };
+        errdefer switch (auth) {
+            .none => {},
+            .bearer => |env| alloc.free(env),
+        };
+        const reviewer = if (self.reviewer_model) |model_id| try alloc.dupe(u8, model_id) else null;
+        errdefer if (reviewer) |model_id| alloc.free(model_id);
+        const header = if (self.session_header) |name| try alloc.dupe(u8, name) else null;
+        errdefer if (header) |name| alloc.free(name);
+        const models = try alloc.alloc(ModelMetadata, self.model_metadata.len);
+        var copied: usize = 0;
+        errdefer {
+            for (models[0..copied]) |metadata| free_metadata(alloc, metadata);
+            alloc.free(models);
+        }
+        for (self.model_metadata) |metadata| {
+            const efforts = try alloc.alloc(EffortOption, metadata.reasoning_efforts.len);
+            var levels: usize = 0;
+            errdefer {
+                for (efforts[0..levels]) |option| {
+                    alloc.free(option.name);
+                    if (option.body) |body| alloc.free(body);
+                }
+                alloc.free(efforts);
+            }
+            for (metadata.reasoning_efforts) |option| {
+                const name = try alloc.dupe(u8, option.name);
+                errdefer alloc.free(name);
+                efforts[levels] = .{ .name = name, .body = if (option.body) |body| try alloc.dupe(u8, body) else null };
+                levels += 1;
+            }
+            var copy = metadata;
+            copy.id = try alloc.dupe(u8, metadata.id);
+            copy.reasoning_efforts = efforts;
+            models[copied] = copy;
+            copied += 1;
+        }
+        return .{
+            .id = id,
+            .protocol = self.protocol,
+            .base_url = base_url,
+            .auth = auth,
+            .tool_choice_mode = self.tool_choice_mode,
+            .reviewer_model = reviewer,
+            .session_header = header,
+            .model_metadata = models,
+        };
+    }
+
+    pub fn deinit(self: Definition, alloc: Allocator) void {
         alloc.free(self.id);
         alloc.free(self.base_url);
         switch (self.auth) {
@@ -104,10 +198,23 @@ pub const Definition = struct {
         }
         if (self.reviewer_model) |id| alloc.free(id);
         if (self.session_header) |name| alloc.free(name);
-        for (self.model_metadata) |metadata| alloc.free(metadata.id);
+        for (self.model_metadata) |metadata| free_metadata(alloc, metadata);
         alloc.free(self.model_metadata);
     }
 };
+
+fn free_metadata(alloc: Allocator, metadata: ModelMetadata) void {
+    alloc.free(metadata.id);
+    free_efforts(alloc, metadata.reasoning_efforts);
+}
+
+fn free_efforts(alloc: Allocator, options: []const EffortOption) void {
+    for (options) |option| {
+        alloc.free(option.name);
+        if (option.body) |body| alloc.free(body);
+    }
+    alloc.free(options);
+}
 
 pub const Registry = struct {
     definitions: []const Definition = &.{},
@@ -261,29 +368,100 @@ fn parse_metadata(alloc: Allocator, value: std.json.Value) ParseError![]const Mo
     const models = try alloc.alloc(ModelMetadata, value.object.count());
     var initialized: usize = 0;
     errdefer {
-        for (models[0..initialized]) |metadata| alloc.free(metadata.id);
+        for (models[0..initialized]) |metadata| free_metadata(alloc, metadata);
         alloc.free(models);
     }
     var iterator = value.object.iterator();
     while (iterator.next()) |entry| {
         try validate_model_id(entry.key_ptr.*);
         const metadata = entry.value_ptr.*;
-        try check_fields(metadata, &.{ "context_window", "max_output_tokens", "supports_tool_use", "supports_vision" });
+        try check_fields(metadata, &.{ "context_window", "max_output_tokens", "supports_tool_use", "supports_vision", "reasoning_efforts" });
         const context = try positive_limit(metadata.object.get("context_window"));
         const output = try positive_limit(metadata.object.get("max_output_tokens"));
         if (context != null and output != null and output.? >= context.?) return error.InvalidModelMetadata;
         const tools = try optional_bool(metadata.object.get("supports_tool_use"));
         const vision = try optional_bool(metadata.object.get("supports_vision"));
+        const efforts = if (metadata.object.get("reasoning_efforts")) |levels| try parse_efforts(alloc, levels) else &.{};
+        errdefer free_efforts(alloc, efforts);
         models[initialized] = .{
             .id = try alloc.dupe(u8, entry.key_ptr.*),
             .context_window = context,
             .max_output_tokens = output,
             .supports_tool_use = tools,
             .supports_vision = vision,
+            .reasoning_efforts = efforts,
         };
         initialized += 1;
     }
     return models;
+}
+
+/// Each level is a name (`"high"`, sent as `reasoning_effort`) or an object
+/// with its own request fields (`{"name":"off","body":{"thinking":{"type":"disabled"}}}`).
+/// Caller owns the returned slice; free it with `free_efforts`.
+fn parse_efforts(alloc: Allocator, value: std.json.Value) ParseError![]const EffortOption {
+    if (value != .array) return error.InvalidReasoningEffort;
+    const items = value.array.items;
+    if (items.len == 0) return error.InvalidReasoningEffort;
+    if (items.len > max_effort_options) return error.LimitExceeded;
+    const options = try alloc.alloc(EffortOption, items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (options[0..initialized]) |option| {
+            alloc.free(option.name);
+            if (option.body) |body| alloc.free(body);
+        }
+        alloc.free(options);
+    }
+    for (items) |item| {
+        const name, const body = switch (item) {
+            .string => |text| .{ text, null },
+            .object => blk: {
+                try check_fields(item, &.{ "name", "body" });
+                const name = try required(item, "name");
+                const body = try required(item, "body");
+                if (name != .string or body != .object or body.object.count() == 0) return error.InvalidReasoningEffort;
+                for (body.object.keys()) |field| {
+                    if (!contains(&reasoning_body_fields, field)) return error.InvalidReasoningEffort;
+                }
+                break :blk .{ name.string, body };
+            },
+            else => return error.InvalidReasoningEffort,
+        };
+        try validate_effort_name(name);
+        for (options[0..initialized]) |previous| {
+            if (std.ascii.eqlIgnoreCase(previous.name, name)) return error.InvalidReasoningEffort;
+        }
+        const owned_name = try alloc.dupe(u8, name);
+        errdefer alloc.free(owned_name);
+        const owned_body = if (body) |object| try serialize(alloc, object) else null;
+        options[initialized] = .{ .name = owned_name, .body = owned_body };
+        initialized += 1;
+    }
+    return options;
+}
+
+/// `default` already means "send nothing" in fx, so a level cannot take it.
+fn validate_effort_name(name: []const u8) ParseError!void {
+    if (name.len == 0 or name.len > max_effort_name_bytes) return error.InvalidReasoningEffort;
+    for (name) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '-' and byte != '_' and byte != '.') return error.InvalidReasoningEffort;
+    }
+    for ([_][]const u8{ "default", "auto", "adaptive" }) |reserved| {
+        if (std.ascii.eqlIgnoreCase(name, reserved)) return error.InvalidReasoningEffort;
+    }
+}
+
+fn contains(list: []const []const u8, value: []const u8) bool {
+    for (list) |item| if (std.mem.eql(u8, item, value)) return true;
+    return false;
+}
+
+fn serialize(alloc: Allocator, value: std.json.Value) Allocator.Error![]u8 {
+    var output: std.Io.Writer.Allocating = .init(alloc);
+    defer output.deinit();
+    std.json.Stringify.value(value, .{}, &output.writer) catch return error.OutOfMemory;
+    return output.toOwnedSlice();
 }
 
 fn positive_limit(value: ?std.json.Value) ParseError!?u32 {
@@ -504,6 +682,37 @@ test "configured provider allocation failures release partial registry and URLs"
 
 const test_required_fields = "\"protocol\":\"openai-chat-completions\",\"base_url\":\"https://example.com/v1\",\"auth\":{\"type\":\"none\"}";
 
+test "configured reasoning levels parse by name or with their own request fields" {
+    const alloc = std.testing.allocator;
+    var registry = try Registry.parse_json(alloc, "{\"local\":{" ++ test_required_fields ++
+        ",\"model_metadata\":{\"m\":{\"reasoning_efforts\":[{\"name\":\"off\",\"body\":{\"thinking\":{\"type\":\"disabled\"}}},\"low\",\"max\"]},\"plain\":{}}}}");
+    defer registry.deinit(alloc);
+    const definition = registry.get("local").?;
+    const metadata = definition.model("m").?;
+    try std.testing.expectEqual(@as(usize, 3), metadata.reasoning_efforts.len);
+    try std.testing.expectEqualStrings("{\"type\":\"disabled\"}", metadata.effort("OFF").?.bodyMembers().?[11..]);
+    try std.testing.expect(metadata.effort("low").?.bodyMembers() == null);
+    try std.testing.expect(metadata.effort("high") == null);
+    try std.testing.expectEqual(@as(usize, 0), definition.model("plain").?.reasoning_efforts.len);
+
+    var copy = try definition.clone(alloc);
+    defer copy.deinit(alloc);
+    try std.testing.expectEqualStrings("off", copy.model("m").?.reasoning_efforts[0].name);
+    try std.testing.expectEqualDeep(definition.binding_identity(), copy.binding_identity());
+}
+
+fn test_clone_allocations(alloc: Allocator) !void {
+    var registry = try Registry.parse_json(alloc, "{\"local\":{" ++ test_required_fields ++
+        ",\"session_header\":\"x-s\",\"model_metadata\":{\"m\":{\"reasoning_efforts\":[{\"name\":\"off\",\"body\":{\"thinking\":false}},\"low\"]},\"n\":{}}}}");
+    defer registry.deinit(alloc);
+    var copy = try registry.get("local").?.clone(alloc);
+    copy.deinit(alloc);
+}
+
+test "configured provider clone and level parsing release partial state on allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, test_clone_allocations, .{});
+}
+
 test "configured provider session header is optional and keeps existing identities" {
     const alloc = std.testing.allocator;
     var plain = try Registry.parse_json(alloc, "{\"local\":{" ++ test_required_fields ++ "}}");
@@ -543,6 +752,17 @@ test "configured provider invalid schemas fail explicitly" {
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"session_header\":\"Authorization\"}}", .err = error.InvalidSessionHeader },
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"session_header\":\"accept\"}}", .err = error.InvalidSessionHeader },
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"session_header\":\"x\\ny\"}}", .err = error.InvalidSessionHeader },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"reasoning_efforts\":[]}}}}", .err = error.InvalidReasoningEffort },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"reasoning_efforts\":\"low\"}}}}", .err = error.InvalidReasoningEffort },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"reasoning_efforts\":[\"default\"]}}}}", .err = error.InvalidReasoningEffort },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"reasoning_efforts\":[\"Auto\"]}}}}", .err = error.InvalidReasoningEffort },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"reasoning_efforts\":[\"low\",\"LOW\"]}}}}", .err = error.InvalidReasoningEffort },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"reasoning_efforts\":[\"bad level\"]}}}}", .err = error.InvalidReasoningEffort },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"reasoning_efforts\":[3]}}}}", .err = error.InvalidReasoningEffort },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"reasoning_efforts\":[{\"name\":\"off\"}]}}}}", .err = error.MissingField },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"reasoning_efforts\":[{\"name\":\"off\",\"body\":{}}]}}}}", .err = error.InvalidReasoningEffort },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"reasoning_efforts\":[{\"name\":\"off\",\"body\":{\"model\":\"x\"}}]}}}}", .err = error.InvalidReasoningEffort },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"reasoning_efforts\":[{\"name\":\"off\",\"body\":{\"thinking\":false},\"extra\":1}]}}}}", .err = error.UnknownField },
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"reviewer_model\":null}}", .err = error.InvalidModelId },
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"reviewer_model\":\"\"}}", .err = error.InvalidModelId },
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"reviewer_model\":\"bad\\nmodel\"}}", .err = error.InvalidModelId },

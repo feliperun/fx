@@ -13,8 +13,17 @@ const io_mod = @import("../core/shared/io.zig");
 const Allocator = std.mem.Allocator;
 
 pub const ToolChoiceMode = configured_provider.ToolChoiceMode;
+/// How the chosen reasoning level reaches the wire, resolved by the caller from
+/// the connection's model metadata. Borrowed during serialization.
+pub const Effort = struct {
+    name: []const u8,
+    /// JSON object members to write instead of `reasoning_effort`.
+    members: ?[]const u8 = null,
+};
+
 pub const Options = struct {
     tool_choice_mode: ToolChoiceMode = .omit,
+    effort: ?Effort = null,
     /// Borrowed only during serialization; includes the configured authority binding.
     provider: ?*const model_provider.ProviderId = null,
 };
@@ -165,7 +174,9 @@ fn validate_request(request: stream_provider.RequestData) Error!void {
     try request.validatePrompt();
     configured_provider.validate_model_id(request.model) catch return error.InvalidModel;
     const options = request.provider_options;
-    if (options.reasoning != null or options.fast or options.prompt_caching) return error.UnsupportedProviderOption;
+    // Reasoning is checked where the request is built: only the caller knows
+    // whether the model declared a wire form for the chosen level.
+    if (options.fast or options.prompt_caching) return error.UnsupportedProviderOption;
     if (options.provider_order.len != 0) return error.UnsupportedProviderOption;
     if (request.response_format != null) return error.UnsupportedResponseFormat;
     // The vision tool runs through a separate provider request; inline image
@@ -394,6 +405,7 @@ fn write_replay(writer: *std.Io.Writer, alloc: Allocator, message: types.ChatMes
 /// Deadline enforcement and prepared-body reuse belong to the transport owner.
 pub fn build_request(alloc: Allocator, input: stream_provider.RequestData, options: Options) Error![]u8 {
     try validate_request(input);
+    if (input.provider_options.reasoning != null and options.effort == null) return error.UnsupportedProviderOption;
     var projected: ?[]types.ChatMessage = null;
     if (options.provider) |provider| {
         projected = try types.projectProviderReplay(alloc, input.messages, .{ .provider = provider.*, .model = input.model });
@@ -602,6 +614,15 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
         }
     }
     if (request.max_output_tokens) |limit| try writer.print(",\"max_tokens\":{d}", .{limit});
+    if (options.effort) |effort| {
+        if (effort.members) |members| {
+            try writer.writeByte(',');
+            try writer.writeAll(members);
+        } else {
+            try writer.writeAll(",\"reasoning_effort\":");
+            try std.json.Stringify.value(effort.name, .{}, writer);
+        }
+    }
     try writer.writeByte('}');
 }
 
