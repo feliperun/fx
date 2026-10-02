@@ -59,10 +59,12 @@ jobs:
           fi
           echo "changed=$([ "$(git rev-parse HEAD)" != "$before" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
 
+      # ReleaseSafe, like the official Full CI: a Debug test run on Linux crashes
+      # four capability tests with "switch on corrupt value" in expectEqualDeep.
       - name: Build and test
         run: |
-          zig build
-          zig build test --summary none
+          zig build -Doptimize=ReleaseSafe
+          zig build test -Doptimize=ReleaseSafe --summary none
 
       - name: Push
         if: steps.sync.outputs.changed == 'true'
