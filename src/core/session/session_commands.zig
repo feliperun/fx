@@ -906,15 +906,19 @@ pub fn Commands(comptime App: type) type {
             fast_mode: bool,
             ultrafast_mode: bool,
         ) !void {
-            // A picker row from another connection arrives as `connection/model`.
-            // It is a provider switch, so effort and speed stay as they are: the
-            // target's capabilities are unknown until its catalog has loaded.
+            // A picker row from another connection arrives as `connection/model`
+            // and is a provider switch. The effort step offered that row's own
+            // levels, so the chosen level is kept before switching; requests
+            // send it only while the active model offers it.
             var qualified: ?[]u8 = null;
             defer if (qualified) |resolved| app.alloc.free(resolved);
             if (comptime @hasField(App, "provider_selection")) {
                 if (try qualifiedSwitch(app, picked)) |target| {
                     qualified = target.model;
                     if (!provider_runtime.provider(app).eql(target.provider)) {
+                        if (model_capabilities.resolveForApp(App, app, picked).reasoning_efforts.len > 0) {
+                            try applyEffort(app, effort, false, true);
+                        }
                         return app_auth_runtime.Runtime(App).switchToModel(app, target.provider, target.model);
                     }
                 }

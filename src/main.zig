@@ -526,6 +526,9 @@ const App = struct {
     provider_selection: provider_runtime.Runtime = provider_runtime.Runtime.init(std.heap.c_allocator),
     model_cache: model_cache_runtime.Runtime = model_cache_runtime.Runtime.init(std.heap.c_allocator, builtin_gateway.models_path),
     sibling_catalogs: sibling_catalog_runtime.Runtime = sibling_catalog_runtime.Runtime.init(std.heap.c_allocator),
+    /// Set while `ensureModelCache` runs, so the warmup it shares with launch
+    /// knows the picker asked for it.
+    model_cache_requested: bool = false,
     usage_dashboard: usage_dashboard_runtime.Runtime = usage_dashboard_runtime.Runtime.init(std.heap.c_allocator),
     workspace_root: []u8 = &.{},
     workspace_identity: statusline_identity.Runtime = .{},
@@ -2245,6 +2248,7 @@ const App = struct {
                 self.auth.oauth_transport,
                 self.auth.secret_store,
                 self.auth.isHostManaged(),
+                self.model_cache_requested,
             );
             self.model_cache.startWarmup(
                 self.providerSet().select(self.provider_selection.selection().provider).model_catalog orelse return,
@@ -2254,6 +2258,10 @@ const App = struct {
     }
 
     pub fn ensureModelCache(self: *App) void {
+        // Only a picker that is being opened reaches the other connections
+        // over the network; launch and auth changes list them from settings.
+        self.model_cache_requested = true;
+        defer self.model_cache_requested = false;
         self.startModelCacheWarmup();
     }
 

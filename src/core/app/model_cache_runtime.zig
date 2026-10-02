@@ -2,6 +2,7 @@ const std = @import("std");
 const credentials = @import("../auth/credentials.zig");
 const secret = @import("../auth/secret.zig");
 const collections = @import("../shared/collections.zig");
+const configured_provider = @import("../config/configured_provider.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
 const model_catalog_metadata = @import("../gateway/model_catalog_metadata.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
@@ -119,6 +120,9 @@ pub const ModelMenuItem = struct {
     id: []u8,
     provider: []const u8,
     capabilities: model_capabilities.Capabilities,
+    /// The row belongs to the active connection: `id` is shown as
+    /// `connection/model`, but choosing it selects the bare model id.
+    active: bool = false,
 
     fn deinit(self: ModelMenuItem, alloc: Allocator) void {
         alloc.free(self.id);
@@ -209,6 +213,7 @@ pub const ModelMenu = struct {
     pub fn selectedModelAlloc(self: *const ModelMenu, alloc: Allocator) !?[]u8 {
         if (!self.active or self.load_state != .ready) return null;
         const item = self.itemAt(self.selected_index) orelse return null;
+        if (item.active and item.id.len > item.provider.len) return try alloc.dupe(u8, item.id[item.provider.len + 1 ..]);
         return try alloc.dupe(u8, item.id);
     }
 
@@ -298,6 +303,10 @@ pub const Runtime = struct {
     /// qualified as `connection/model`. They only feed the picker: requests and
     /// completions keep resolving against `catalog`, the active connection.
     siblings: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty,
+    /// Connection label shown in front of the active catalog's rows. Empty for
+    /// the Gateway, whose ids already carry the publisher.
+    active_connection_buf: [configured_provider.max_id_bytes]u8 = undefined,
+    active_connection_len: u8 = 0,
     mutex: std.Io.Mutex = .init,
     thread: ?std.Thread = null,
     state: ModelCacheState = .idle,
@@ -323,6 +332,20 @@ pub const Runtime = struct {
         model_catalog.freeModelCatalog(self.alloc, &self.siblings);
     }
 
+    /// Names the connection whose catalog is the active one so its rows read
+    /// `connection/model` like every other row. Null or empty leaves ids as the
+    /// catalog reports them.
+    pub fn setActiveConnection(self: *Self, connection: ?[]const u8) void {
+        const name = connection orelse "";
+        const len = @min(name.len, self.active_connection_buf.len);
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        if (std.mem.eql(u8, self.active_connection_buf[0..self.active_connection_len], name[0..len])) return;
+        @memcpy(self.active_connection_buf[0..len], name[0..len]);
+        self.active_connection_len = @intCast(len);
+        self.completion_pending = true;
+    }
+
     /// Replaces every sibling row of `connection` with `entries`, whose ids are
     /// bare model ids. Takes ownership of `entries` and its contents. An empty
     /// list removes the connection from the picker.
@@ -341,6 +364,12 @@ pub const Runtime = struct {
 
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
+        // A background refresh that finishes after a switch must not list the
+        // connection that has just become the active one.
+        if (std.mem.eql(u8, connection, self.active_connection_buf[0..self.active_connection_len])) {
+            model_catalog.freeModelCatalog(self.alloc, &incoming);
+            incoming = .empty;
+        }
         var kept: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty;
         errdefer kept.deinit(self.alloc);
         try kept.ensureTotalCapacity(self.alloc, self.siblings.items.len + incoming.items.len);
@@ -617,9 +646,13 @@ pub const Runtime = struct {
         self.finishThreadIfDone();
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
-        if (self.state != .ready) return null;
-
-        const entry = findCatalogModel(self.catalog.items, model) orelse return null;
+        if (self.state == .ready) {
+            if (findCatalogModel(self.catalog.items, model)) |entry| return model_catalog_metadata.fromCatalogEntry(entry.*);
+        }
+        // A `connection/model` row of another connection carries its own
+        // levels, which the picker's effort step offers before the switch. The
+        // active catalog answers first: a Gateway id can look the same.
+        const entry = findCatalogModel(self.siblings.items, model) orelse return null;
         return model_catalog_metadata.fromCatalogEntry(entry.*);
     }
 
@@ -840,7 +873,7 @@ pub const Runtime = struct {
                 menu.clearSnapshot(self.alloc);
                 menu.load_state = .failed;
             },
-            .ready => try hydrateMenuSnapshot(self.alloc, menu, self.catalog.items, self.siblings.items),
+            .ready => try hydrateMenuSnapshot(self.alloc, menu, self.catalog.items, self.siblings.items, self.active_connection_buf[0..self.active_connection_len]),
         }
         menu.catalog_state = modelMenuCatalogState(self.outcome, self.from_profile_settings);
     }
@@ -889,6 +922,7 @@ fn hydrateMenuSnapshot(
     menu: *ModelMenu,
     catalog: []const model_catalog.ModelCatalogEntry,
     siblings: []const model_catalog.ModelCatalogEntry,
+    active_connection: []const u8,
 ) !void {
     var items: std.ArrayList(ModelMenuItem) = .empty;
     errdefer {
@@ -897,16 +931,21 @@ fn hydrateMenuSnapshot(
     }
     try items.ensureTotalCapacity(alloc, catalog.len + siblings.len);
 
-    for ([_][]const model_catalog.ModelCatalogEntry{ catalog, siblings }) |source| {
+    for ([_][]const model_catalog.ModelCatalogEntry{ catalog, siblings }, 0..) |source, source_index| {
+        const label_rows = source_index == 0 and active_connection.len > 0;
         for (source) |entry| {
             const item = item: {
-                const id = try alloc.dupe(u8, entry.id);
+                const id = if (label_rows)
+                    try std.fmt.allocPrint(alloc, "{s}/{s}", .{ active_connection, entry.id })
+                else
+                    try alloc.dupe(u8, entry.id);
                 errdefer alloc.free(id);
                 break :item ModelMenuItem{
                     .id = id,
                     .provider = modelProvider(id),
+                    .active = label_rows,
                     .capabilities = model_capabilities.resolveCapabilities(
-                        id,
+                        entry.id,
                         model_catalog_metadata.fromCatalogEntry(entry),
                     ),
                 };
@@ -967,6 +1006,28 @@ test "picker lists other connections as connection/model rows" {
     try std.testing.expectEqualStrings("opencode-go/glm-5.3", runtime.menu.itemAt(3).?.id);
     runtime.menu.setQuery("opencode-go");
     try std.testing.expectEqual(@as(usize, 1), runtime.menu.filteredItemCount());
+
+    // The active connection's rows carry its label too, and choosing one
+    // selects the bare id so effort and speed stages resolve as before.
+    runtime.setActiveConnection("deepseek");
+    try runtime.openMenu();
+    try std.testing.expectEqualStrings("deepseek/deepseek-flash", runtime.menu.itemAt(0).?.id);
+    try std.testing.expectEqualStrings("deepseek", runtime.menu.itemAt(0).?.provider);
+    try std.testing.expect(runtime.menu.itemAt(0).?.active);
+    runtime.menu.setQuery("");
+    runtime.menu.selected_index = 0;
+    const own = (try runtime.menu.selectedModelAlloc(alloc)).?;
+    defer alloc.free(own);
+    try std.testing.expectEqualStrings("deepseek-flash", own);
+    runtime.menu.selected_index = 1;
+    const other = (try runtime.menu.selectedModelAlloc(alloc)).?;
+    defer alloc.free(other);
+    try std.testing.expectEqualStrings("glm/glm-5.3", other);
+    runtime.setActiveConnection(null);
+    try runtime.openMenu();
+    runtime.menu.setQuery("opencode-go");
+    try std.testing.expectEqualStrings("opencode-go/glm-5.3", runtime.menu.itemAt(0).?.id);
+    runtime.menu.setQuery("");
 
     // A refresh replaces only its own connection; an empty list removes it.
     try runtime.replaceSiblings("glm", try testSiblingEntries(alloc, &.{"glm-5.4"}));
@@ -1564,7 +1625,7 @@ test "model menu owns resolved catalog state and filters without changing catalo
         },
     };
     runtime.state = .ready;
-    try hydrateMenuSnapshot(alloc, &runtime.menu, &entries, &.{});
+    try hydrateMenuSnapshot(alloc, &runtime.menu, &entries, &.{}, "");
     runtime.menu.active = true;
 
     try std.testing.expectEqual(ModelMenuLoadState.ready, runtime.menu.load_state);
@@ -1612,7 +1673,7 @@ test "model menu provider navigation skips absent and redundant filters" {
     };
     var mixed: ModelMenu = .{};
     defer mixed.deinit(alloc);
-    try hydrateMenuSnapshot(alloc, &mixed, &mixed_entries, &.{});
+    try hydrateMenuSnapshot(alloc, &mixed, &mixed_entries, &.{}, "");
     mixed.active = true;
 
     try std.testing.expect(mixed.moveProvider(1));
@@ -1628,7 +1689,7 @@ test "model menu provider navigation skips absent and redundant filters" {
     };
     var codex: ModelMenu = .{};
     defer codex.deinit(alloc);
-    try hydrateMenuSnapshot(alloc, &codex, &codex_entries, &.{});
+    try hydrateMenuSnapshot(alloc, &codex, &codex_entries, &.{}, "");
     codex.active = true;
 
     try std.testing.expect(!codex.moveProvider(1));
@@ -1644,14 +1705,14 @@ test "model menu snapshot construction cleans every allocation failure" {
 
     var probe = std.testing.FailingAllocator.init(backing, .{});
     var menu: ModelMenu = .{};
-    try hydrateMenuSnapshot(probe.allocator(), &menu, &entries, &.{});
+    try hydrateMenuSnapshot(probe.allocator(), &menu, &entries, &.{}, "");
     menu.deinit(probe.allocator());
     try std.testing.expectEqual(probe.allocated_bytes, probe.freed_bytes);
 
     for (0..probe.alloc_index) |fail_index| {
         var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = fail_index });
         var failed_menu: ModelMenu = .{};
-        if (hydrateMenuSnapshot(failing.allocator(), &failed_menu, &entries, &.{})) {
+        if (hydrateMenuSnapshot(failing.allocator(), &failed_menu, &entries, &.{}, "")) {
             failed_menu.deinit(failing.allocator());
         } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
         try std.testing.expect(failing.has_induced_failure);
