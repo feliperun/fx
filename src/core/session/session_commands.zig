@@ -901,11 +901,25 @@ pub fn Commands(comptime App: type) type {
 
         pub fn selectModelFromPicker(
             app: *App,
-            model: []const u8,
+            picked: []const u8,
             effort: types.ReasoningEffort,
             fast_mode: bool,
             ultrafast_mode: bool,
         ) !void {
+            // A picker row from another connection arrives as `connection/model`.
+            // It is a provider switch, so effort and speed stay as they are: the
+            // target's capabilities are unknown until its catalog has loaded.
+            var qualified: ?[]u8 = null;
+            defer if (qualified) |resolved| app.alloc.free(resolved);
+            if (comptime @hasField(App, "provider_selection")) {
+                if (try qualifiedSwitch(app, picked)) |target| {
+                    qualified = target.model;
+                    if (!provider_runtime.provider(app).eql(target.provider)) {
+                        return app_auth_runtime.Runtime(App).switchToModel(app, target.provider, target.model);
+                    }
+                }
+            }
+            const model = qualified orelse picked;
             try setResolvedModelRuntime(app, model);
             var patch = app_session_runtime.SessionPreferencePatch{
                 .provider = provider_runtime.provider(app),
@@ -1177,6 +1191,7 @@ pub fn Commands(comptime App: type) type {
         /// switch target instead. The active connection is asked first so its
         /// models keep winning ties.
         fn resolveProviderSwitch(app: *App, query: []const u8) !?ProviderSwitch {
+            if (try qualifiedSwitch(app, query)) |target| return target;
             const active = provider_runtime.provider(app);
             if (active == .configured) {
                 if (try configuredSwitchForModel(app, active, query)) |target| return target;
@@ -1194,6 +1209,25 @@ pub fn Commands(comptime App: type) type {
             const registry = app.provider_selection.definitions;
             if (registry.get(named.label()) == null) return null;
             return .{ .provider = named.bind(registry) catch return null, .model = null };
+        }
+
+        /// `connection/model` names one connection's model outright, which is how
+        /// the picker tells apart ids that two connections both serve (glm-5.3 on
+        /// glm and on opencode-go). A configured connection must list the model
+        /// so a Gateway publisher id such as `deepseek/deepseek-v3` still reaches
+        /// the Gateway; a built-in route resolves the model in its own catalog
+        /// while the switch is prepared. Caller owns the returned model.
+        fn qualifiedSwitch(app: *App, query: []const u8) !?ProviderSwitch {
+            const slash = std.mem.findScalar(u8, query, '/') orelse return null;
+            const connection = query[0..slash];
+            const model = query[slash + 1 ..];
+            if (connection.len == 0 or model.len == 0) return null;
+            const provider = model_provider.parse(connection) orelse return null;
+            return switch (provider) {
+                .gateway => null,
+                .codex, .grok => .{ .provider = provider, .model = try app.alloc.dupe(u8, model) },
+                .configured => try configuredSwitchForModel(app, provider, model),
+            };
         }
 
         fn configuredSwitchForModel(
@@ -2465,6 +2499,20 @@ test "session_commands /model reaches a configured provider" {
     const builtin = (try Commands(SwitchApp).resolveProviderSwitch(&app, "codex")).?;
     try std.testing.expectEqual(model_provider.ProviderId.codex, builtin.provider);
     try std.testing.expect(builtin.model == null);
+
+    // A connection prefix picks that connection's copy of an id both serve.
+    const qualified = (try Commands(SwitchApp).resolveProviderSwitch(&app, "glm/glm-5.3")).?;
+    defer alloc.free(qualified.model.?);
+    try std.testing.expectEqualStrings("glm", qualified.provider.label());
+    try std.testing.expectEqualStrings("glm-5.3", qualified.model.?);
+    const route = (try Commands(SwitchApp).resolveProviderSwitch(&app, "codex/gpt-5.6-sol")).?;
+    defer alloc.free(route.model.?);
+    try std.testing.expectEqual(model_provider.ProviderId.codex, route.provider);
+    try std.testing.expectEqualStrings("gpt-5.6-sol", route.model.?);
+    // A prefix the connection does not serve, or a Gateway publisher, is not a switch.
+    try std.testing.expect(try Commands(SwitchApp).resolveProviderSwitch(&app, "glm/unknown") == null);
+    try std.testing.expect(try Commands(SwitchApp).resolveProviderSwitch(&app, "gateway/x") == null);
+    try std.testing.expect(try Commands(SwitchApp).resolveProviderSwitch(&app, "openai/gpt-4o") == null);
 
     // Everything else stays a model query for the active provider.
     try std.testing.expect(try Commands(SwitchApp).resolveProviderSwitch(&app, "gpt-4o") == null);

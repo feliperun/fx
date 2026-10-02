@@ -15,6 +15,7 @@ const js_host_clipboard = @import("core/hosts/js_host_clipboard.zig");
 const credentials = @import("core/auth/credentials.zig");
 const secret = @import("core/auth/secret.zig");
 const model_cache_runtime = @import("core/app/model_cache_runtime.zig");
+const sibling_catalog_runtime = @import("core/app/sibling_catalog_runtime.zig");
 const usage_dashboard_runtime = @import("core/app/usage_dashboard_runtime.zig");
 const app_auth_runtime = @import("core/app/app_auth_runtime.zig");
 const app_host_config_runtime = @import("core/app/app_host_config_runtime.zig");
@@ -522,6 +523,7 @@ const App = struct {
     ),
     provider_selection: provider_runtime.Runtime = provider_runtime.Runtime.init(std.heap.c_allocator),
     model_cache: model_cache_runtime.Runtime = model_cache_runtime.Runtime.init(std.heap.c_allocator, builtin_gateway.models_path),
+    sibling_catalogs: sibling_catalog_runtime.Runtime = sibling_catalog_runtime.Runtime.init(std.heap.c_allocator),
     usage_dashboard: usage_dashboard_runtime.Runtime = usage_dashboard_runtime.Runtime.init(std.heap.c_allocator),
     workspace_root: []u8 = &.{},
     workspace_identity: statusline_identity.Runtime = .{},
@@ -963,6 +965,7 @@ const App = struct {
         };
         self.terminal_client.deinit();
         self.managed_executions.deinit();
+        self.sibling_catalogs.deinit();
         self.model_cache.deinit();
         self.usage_dashboard.deinit();
         InputSubmitRuntime.clearPendingSubmission(self, "shutdown");
@@ -2239,6 +2242,14 @@ const App = struct {
                 debug_trace.logf("auth", "model_cache_warmup_deferred reason=startup_credential_pending", .{});
                 return;
             }
+            self.sibling_catalogs.refresh(
+                &self.model_cache,
+                self.providerSet(),
+                self.provider_selection.selection().provider,
+                self.auth.oauth_transport,
+                self.auth.secret_store,
+                self.auth.isHostManaged(),
+            );
             self.model_cache.startWarmup(
                 self.providerSet().select(self.provider_selection.selection().provider).model_catalog orelse return,
                 self.auth.modelCatalogAccess(),
@@ -4778,6 +4789,7 @@ test {
     _ = input_submit_runtime;
     _ = @import("core/app/app_lifecycle.zig");
     _ = @import("core/app/model_cache_runtime.zig");
+    _ = @import("core/app/sibling_catalog_runtime.zig");
     _ = @import("core/app/usage_dashboard_runtime.zig");
     _ = @import("core/app/app_process_runtime.zig");
     _ = @import("core/app/app_render_runtime.zig");
