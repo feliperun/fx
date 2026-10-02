@@ -1337,6 +1337,22 @@ pub fn Runtime(comptime App: type) type {
                         .gateway, .configured => {},
                     }
                 }
+                if (target == .configured and comptime @hasField(App, "provider_selection")) {
+                    // The Gateway sign-in text names a credential this route never
+                    // reads; the connection's own environment variable is the fix.
+                    if (app.provider_selection.definitions.get(target.label())) |definition| {
+                        if (definition.auth == .bearer) {
+                            const body = try std.fmt.allocPrint(
+                                app.alloc,
+                                "{s} has no API key. Set {s} and try again. The current provider is unchanged.",
+                                .{ target.label(), definition.auth.bearer },
+                            );
+                            defer app.alloc.free(body);
+                            try app.writeDomainNotice(.{ .topic = "provider", .tone = .warning, .body = body }, true);
+                            return false;
+                        }
+                    }
+                }
                 if (target == .gateway or !request.allow_login) {
                     try app.writeDomainNotice(.{
                         .topic = "provider",
