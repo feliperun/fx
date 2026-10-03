@@ -901,18 +901,11 @@ pub const Reducer = struct {
                 if (non_null(function, "name")) |name_value| {
                     const fragment = try string(name_value);
                     try append_bounded(self.alloc, &tool.name, fragment, @min(max_name_bytes, self.limits.identity_bytes), error.IdentityTooLarge);
-                    var prefix = false;
-                    for (self.names.items) |name| prefix = prefix or std.mem.startsWith(u8, name, tool.name.items);
-                    if (!prefix) return error.InvalidToolName;
+                    try validate_name(tool.name.items);
                 }
                 if (non_null(function, "arguments")) |arguments| try append_bounded(self.alloc, &tool.arguments, try string(arguments), self.limits.arguments_bytes, error.ArgumentsTooLarge);
             }
         }
-    }
-
-    fn known_name(self: *const Reducer, name: []const u8) bool {
-        for (self.names.items) |candidate| if (std.mem.eql(u8, candidate, name)) return true;
-        return false;
     }
 
     fn accept_usage(self: *Reducer, value: std.json.Value, final: bool) Error!void {
@@ -985,7 +978,11 @@ pub const Reducer = struct {
         if (self.choice == .required and self.tools.items.len == 0) return error.RequiredToolMissing;
         for (self.tools.items) |tool| {
             if (tool.id == null) return error.InvalidToolCallId;
-            if (!self.known_name(tool.name.items)) return error.InvalidToolName;
+            // A well-formed name this request did not advertise goes to the
+            // dispatcher, as on the Gateway and Codex routes: it answers
+            // `unknown tool` to the model, or runs a configured tool whose
+            // selection lapsed with the previous turn, instead of failing the turn.
+            try validate_name(tool.name.items);
             try validate_arguments(self.alloc, tool.arguments.items);
         }
         const provider_state = self.reasoning_state() catch |err| switch (err) {
@@ -2343,7 +2340,7 @@ test "chat completions rejects malformed chunks contradictory identities and ext
         .{ .first = test_text, .chunk = "{\"id\":\"other\",\"choices\":[]}", .failure = error.ConflictingIdentity },
         .{ .first = test_text, .chunk = "{\"model\":\"other\",\"choices\":[]}", .failure = error.ConflictingIdentity },
         .{ .first = test_call, .chunk = "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"other\"}]}}]}", .failure = error.ConflictingIdentity },
-        .{ .first = test_call, .chunk = "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"shell\"}}]}}]}", .failure = error.InvalidToolName },
+        .{ .first = test_call, .chunk = "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\" shell\"}}]}}]}", .failure = error.InvalidToolName },
         .{ .first = test_call, .chunk = "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call-1\"}]}}]}", .failure = error.ConflictingIdentity },
         .{ .chunk = "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":-1}]}}]}", .failure = error.InvalidChunk },
         .{ .chunk = "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0},{\"index\":0}]}}]}", .failure = error.ConflictingIdentity },
@@ -2572,7 +2569,7 @@ test "chat completions missing tool fields sparse indexes and invalid identities
         .{ .delta = "{\"index\":1,\"id\":\"x\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{}\"}}", .failure = error.InvalidToolCallId, .at_finish = true },
         .{ .delta = "{\"index\":0,\"id\":\"\"}", .failure = error.InvalidChunk },
         .{ .delta = "{\"index\":0,\"id\":7}", .failure = error.InvalidChunk },
-        .{ .delta = "{\"index\":0,\"function\":{\"name\":\"not_advertised\"}}", .failure = error.InvalidToolName },
+        .{ .delta = "{\"index\":0,\"function\":{\"name\":\"bad name\"}}", .failure = error.InvalidToolName },
         .{ .delta = "{\"index\":0,\"function\":{\"name\":3}}", .failure = error.InvalidChunk },
         .{ .delta = "{\"index\":0,\"function\":{\"arguments\":{}}}", .failure = error.InvalidChunk },
         .{ .delta = "{\"index\":999999999}", .failure = error.TooManyTools },
@@ -2587,6 +2584,16 @@ test "chat completions missing tool fields sparse indexes and invalid identities
             try std.testing.expectError(case.failure, test_finish(&reducer, test_tools_finish));
         } else try std.testing.expectError(case.failure, reducer.accept(chunk, false));
     }
+}
+
+test "chat completions hands a well-formed unadvertised tool name to the dispatcher" {
+    const alloc = std.testing.allocator;
+    var reducer = try Reducer.init(alloc, test_tool_request(), .{});
+    defer reducer.deinit();
+    try test_accept(&reducer, "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-9\",\"function\":{\"name\":\"mcp_claude-code_claude_code\",\"arguments\":\"{}\"}}]}}]}");
+    var result = try test_finish(&reducer, test_tools_finish);
+    defer result.deinit(alloc);
+    try std.testing.expectEqualStrings("mcp_claude-code_claude_code", result.completed.completion.tool_calls[0].name);
 }
 
 test "chat completions repeated consistent identity preserves one call and selected names are owned" {
