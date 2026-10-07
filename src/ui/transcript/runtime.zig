@@ -1707,6 +1707,20 @@ test "user prompt card commit caches the same source a frame would rebuild" {
         false,
     ) == null);
     try std.testing.expect(runtime.full_transcript_content_revision != unframed_revision);
+
+    // With the full transcript open the commit prepares at full depth, which
+    // the next inline frame must not reuse.
+    runtime.has_committed_frame = true;
+    runtime.full_transcript = .{ .depth = .full };
+    const full_depth_revision = runtime.full_transcript_content_revision;
+    var full_depth_text = "FULL_DEPTH_PROMPT".*;
+    _ = try runtime.writeUserPromptCard(alloc, &metrics, .{ .text = &full_depth_text }, true, &.{});
+    try std.testing.expect(runtime.full_transcript_content_revision != full_depth_revision);
+    try std.testing.expect(runtime.compact_transcript_source_cache.find(
+        runtime.full_transcript_content_revision,
+        runtime.layout.cols,
+        true,
+    ) == null);
 }
 
 test "compact transcript cache survives navigation and invalidates on content change" {
@@ -10354,10 +10368,11 @@ pub const TranscriptRuntime = struct {
     }
 
     /// Takes ownership of the source a recorded mutation commit prepared for
-    /// the committed entries and caches it for the next frame, which would
-    /// otherwise render every entry again. Discards it when the content
-    /// revision did not advance, before the first committed frame, or while a
-    /// resume source owns preparation.
+    /// the committed entries and caches it for the next inline frame, which
+    /// would otherwise render every entry again. Discards it whenever a frame
+    /// would prepare differently from the commit: the content revision did not
+    /// advance, no frame has committed yet, a resume source owns preparation,
+    /// the full transcript is open, or released rows are still published.
     pub fn adoptCommittedTranscriptSource(
         self: *TranscriptRuntime,
         alloc: Allocator,
@@ -10365,9 +10380,15 @@ pub const TranscriptRuntime = struct {
         previous_revision: u64,
     ) void {
         var source = committed;
+        const publishes_released_rows = if (self.committedRetentionIdentity()) |identity|
+            identity.publication_entries.len > 0
+        else
+            false;
         if (self.full_transcript_content_revision == previous_revision or
             !self.has_committed_frame or
             self.pending_resume_source != null or
+            self.fullTranscriptActive() or
+            publishes_released_rows or
             source.cols != self.layout.cols)
         {
             source.deinit(alloc);

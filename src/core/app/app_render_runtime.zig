@@ -2664,6 +2664,19 @@ test "pending prompt at an occupied band bottom preserves the summary through ad
     try std.testing.expectEqualStrings(finished, quiet);
 }
 
+fn currentCompactSourceBytes(shell: *const transcript_runtime.TranscriptRuntime) ?[*]const u8 {
+    for (shell.compact_transcript_source_cache.entries) |entry| {
+        const cached = entry orelse continue;
+        if (cached.content_revision == shell.full_transcript_content_revision and
+            cached.cols == shell.layout.cols and
+            cached.has_committed_frame == shell.has_committed_frame)
+        {
+            return cached.source.bytes.ptr;
+        }
+    }
+    return null;
+}
+
 fn findGridRow(alloc: std.mem.Allocator, physical: *vt_emulator.Grid, needle: []const u8) !?u16 {
     var row_text: std.ArrayList(u8) = .empty;
     defer row_text.deinit(alloc);
@@ -2730,7 +2743,10 @@ test "pending prompt on a full screen is visible before adoption and keeps its r
 
     app.submission.pending.?.phase = .adopted;
     _ = try app.shell.writeUserPromptCard(alloc, &app.metrics, .{ .text = app.submission.pending.?.draft.prompt }, true, &.{});
+    const seeded = currentCompactSourceBytes(&app.shell) orelse return error.CommittedSourceNotCached;
     _ = try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
+    // The frame that shows the card reused the commit's source.
+    try std.testing.expectEqual(seeded, currentCompactSourceBytes(&app.shell) orelse return error.CommittedSourceDropped);
     try std.testing.expectEqual(preview_row, (try findGridRow(alloc, &physical, prompt)) orelse return error.AdoptedCardMissing);
     const adopted = try rewritePublicationText(alloc, &physical, history.items);
     defer alloc.free(adopted);
@@ -2740,6 +2756,59 @@ test "pending prompt on a full screen is visible before adoption and keeps its r
     const quiet = try rewritePublicationText(alloc, &physical, history.items);
     defer alloc.free(quiet);
     try std.testing.expectEqualStrings(adopted, quiet);
+}
+
+test "pending steering on a full screen paints below the summary and leaves no fragment" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "pending-steering-full-screen.log", .{ .read = true });
+    defer file.close(std.testing.io);
+    var app = CoordinatorTestApp{
+        .alloc = alloc,
+        .shell = .{ .stdout_file = file, .layout = .{ .cols = 80, .rows = 24, .content_bottom = 20, .divider_top_row = 21, .input_row = 22, .divider_bottom_row = 23, .hint_row = 24 } },
+    };
+    defer app.deinit();
+    try app.selected_model.appendSlice(alloc, "test-model");
+    try app.shell.initBacking(alloc);
+    try app.shell.enableShadowVt(alloc);
+    var physical = try vt_emulator.Grid.init(alloc, 80, 24);
+    defer physical.deinit();
+    physical.defer_sync_updates = false;
+    var history: std.ArrayList(u8) = .empty;
+    defer history.deinit(alloc);
+    var offset: u64 = 0;
+    _ = try app.shell.appendRawTranscriptEntryClassified(alloc, "previous answer\n" ** 60, .unknown_raw);
+    const summary = "  6m 25s (↑14 ↓30k)";
+    _ = try app.shell.appendRawTranscriptEntryClassified(alloc, summary, .turn_summary);
+    app.shell.render_requests.request(.first_frame);
+    app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    const first = try readCoordinatorFrameBytes(alloc, file, &offset);
+    defer alloc.free(first);
+    try feedRewritePublicationFrame(alloc, &physical, &history, first);
+    for (0..3) |_| _ = try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
+    try std.testing.expect(app.shell.cursor_col > 1);
+    try std.testing.expect(app.shell.cursor_row >= app.shell.layout.content_bottom);
+
+    const steering = "FULL_SCREEN_STEERING";
+    app.worker.steering_messages = &.{steering};
+    _ = try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
+    const steering_row = (try findGridRow(alloc, &physical, steering)) orelse return error.SteeringPreviewNotPainted;
+    const summary_row = (try findGridRow(alloc, &physical, "6m 25s")) orelse return error.SummaryMissing;
+    try std.testing.expectEqual(summary_row + 2, steering_row);
+    try std.testing.expect(steering_row <= app.shell.layout.content_bottom);
+    const preview = try rewritePublicationText(alloc, &physical, history.items);
+    defer alloc.free(preview);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, preview, summary));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, preview, steering));
+
+    app.worker.steering_messages = &.{};
+    _ = try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
+    const cleared = try rewritePublicationText(alloc, &physical, history.items);
+    defer alloc.free(cleared);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, cleared, summary));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, cleared, steering));
 }
 
 test "pending prompt taller than a near-empty transcript reaches scrollback through adoption" {
@@ -3583,6 +3652,22 @@ const CoordinatorTestWorker = struct {
     submitted_permission: ?types.ToolPermissionDecision = null,
     cancel_requested: bool = false,
     cancel_continues_turn: bool = false,
+    steering_messages: []const []const u8 = &.{},
+
+    pub fn snapshotSteeringPresentation(
+        self: *const @This(),
+        alloc: std.mem.Allocator,
+    ) !@import("../agent/worker_runtime.zig").SteeringPresentationSnapshot {
+        var snapshot: @import("../agent/worker_runtime.zig").SteeringPresentationSnapshot = .{};
+        errdefer snapshot.deinit(alloc);
+        if (self.steering_messages.len == 0) return snapshot;
+        snapshot.messages = try alloc.alloc([]u8, self.steering_messages.len);
+        for (snapshot.messages) |*message| message.* = &.{};
+        for (self.steering_messages, 0..) |message, index| {
+            snapshot.messages[index] = try alloc.dupe(u8, message);
+        }
+        return snapshot;
+    }
 
     pub fn isCancelRequested(self: *const @This()) bool {
         return self.cancel_requested;
