@@ -6,6 +6,7 @@ const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
 const mcp_health = @import("../mcp/health.zig");
+const mode_contract = @import("../modes/mode_contract.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
 const permissions = @import("../permissions/permissions.zig");
 const session_codec = @import("../session/session_codec.zig");
@@ -484,12 +485,20 @@ pub const StatusSnapshot = struct {
     mcp_config_error: ?[]const u8 = null,
     mcp_config_warning: ?mcp_contract.ProfileConfigWarning = null,
     permission_mode: types.PermissionMode,
+    /// The session modes ACP offers and the one a new session starts in,
+    /// when the caller has a mode registry with modes.
+    modes: ?SessionModes = null,
     workspace_root: []const u8,
     history_turns: usize,
     session_permission_grants: usize,
     agent_step_limit: usize,
     /// Requested Ultra mode. The serving provider may still fall back.
     ultrafast_requested: bool = false,
+
+    pub const SessionModes = struct {
+        current: []const u8,
+        all: []const mode_contract.ModeSpec,
+    };
 
     pub fn render(self: StatusSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
         return switch (format) {
@@ -684,6 +693,22 @@ pub const StatusSnapshot = struct {
         }
         try writer.writeAll(",\"permission_mode\":");
         try std.json.Stringify.value(permissionModeLabel(self.permission_mode), .{}, writer);
+        if (self.modes) |modes| {
+            try writer.writeAll(",\"mode\":");
+            try std.json.Stringify.value(modes.current, .{}, writer);
+            try writer.writeAll(",\"modes\":[");
+            for (modes.all, 0..) |mode, index| {
+                if (index > 0) try writer.writeByte(',');
+                try writer.writeAll("{\"id\":");
+                try std.json.Stringify.value(mode.id, .{}, writer);
+                try writer.writeAll(",\"name\":");
+                try std.json.Stringify.value(mode.name, .{}, writer);
+                try writer.writeAll(",\"description\":");
+                try std.json.Stringify.value(mode.description, .{}, writer);
+                try writer.writeByte('}');
+            }
+            try writer.writeByte(']');
+        }
         try writer.writeAll(",\"workspace\":");
         try std.json.Stringify.value(self.workspace_root, .{}, writer);
         try writer.print(",\"history_turns\":{d}", .{self.history_turns});
@@ -2097,6 +2122,38 @@ test "status reports the effort a new session starts with after the model" {
     const plain = try unresolved.renderJson(std.testing.allocator);
     defer std.testing.allocator.free(plain);
     try std.testing.expect(std.mem.find(u8, plain, "effort") == null);
+}
+
+test "status JSON lists the session modes after the permission mode" {
+    const modes = [_]mode_contract.ModeSpec{
+        .{ .id = "careful", .name = "Careful", .description = "Asks first", .permission_mode = .ask },
+        .{ .id = "open", .name = "Open", .permission_mode = .yolo },
+    };
+    var snapshot = StatusSnapshot{
+        .model = "provider/model",
+        .permission_mode = .yolo,
+        .modes = .{ .current = "open", .all = modes[0..] },
+        .workspace_root = "/tmp/fx",
+        .history_turns = 0,
+        .session_permission_grants = 0,
+        .agent_step_limit = 24,
+    };
+    const json = try snapshot.renderJson(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.find(
+        u8,
+        json,
+        "\"permission_mode\":\"yolo\",\"mode\":\"open\",\"modes\":[{\"id\":\"careful\",\"name\":\"Careful\",\"description\":\"Asks first\"},{\"id\":\"open\",\"name\":\"Open\",\"description\":\"\"}],\"workspace\":",
+    ) != null);
+
+    const text = try snapshot.renderText(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.find(u8, text, "careful") == null);
+
+    snapshot.modes = null;
+    const plain = try snapshot.renderJson(std.testing.allocator);
+    defer std.testing.allocator.free(plain);
+    try std.testing.expect(std.mem.find(u8, plain, "\"modes\"") == null);
 }
 
 test "MCP config diagnostic renders in status text and JSON but not interactive body" {

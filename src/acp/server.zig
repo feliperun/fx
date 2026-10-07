@@ -3532,10 +3532,10 @@ pub fn loadStartingMode(state: *ServerState, alloc: Allocator) StartingMode {
             }
         }
     }
-    const registry = state.cfg.mode_registry;
-    const mode = registry.forPermission(state.permission_mode) orelse
-        return .{ .id = registry.default_mode_id, .permission_mode = state.permission_mode };
-    return .{ .id = mode.id, .permission_mode = mode.permission_mode };
+    return .{
+        .id = state.cfg.mode_registry.startingModeId(state.permission_mode),
+        .permission_mode = state.permission_mode,
+    };
 }
 
 test "applySessionMode uses registered mode policy and ignores unknown modes" {
