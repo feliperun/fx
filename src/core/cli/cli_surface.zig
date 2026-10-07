@@ -1388,6 +1388,7 @@ fn runNonInteractiveWithDeps(
             }, mcp_inspection.profile_diagnostic);
             snapshot.mcp = localMcpView(&mcp_inspection);
             snapshot.provider_endpoint = startup.provider_endpoint;
+            snapshot.modes = statusModes(cfg.mode_registry, snapshot.permission_mode);
             if (opts.format == .json) {
                 try writeStatusJsonLine(alloc, deps, snapshot);
                 return .handled_success;
@@ -2948,6 +2949,28 @@ fn argsContainJson(args: anytype) bool {
 
 fn workflowLanguagePlaceholder() types.ConversationLanguage {
     return types.ConversationLanguage.default();
+}
+
+/// The session modes `fx status` reports, so a client can show the mode
+/// choice before an ACP session exists. Null for a registry without modes.
+fn statusModes(registry: mode_registry.Registry, permission_mode: types.PermissionMode) ?output_contracts.StatusSnapshot.SessionModes {
+    if (registry.modes.len == 0) return null;
+    return .{ .current = registry.startingModeId(permission_mode), .all = registry.modes };
+}
+
+test "status reports the mode a new session starts in" {
+    const modes = [_]mode_registry.ModeSpec{
+        .{ .id = "auto", .name = "Auto", .permission_mode = .auto },
+        .{ .id = "ask", .name = "Ask", .permission_mode = .ask },
+        .{ .id = "full-access", .name = "Full access", .permission_mode = .yolo },
+    };
+    const registry = mode_registry.Registry{ .default_mode_id = "auto", .modes = modes[0..] };
+
+    const full = statusModes(registry, .yolo) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("full-access", full.current);
+    try std.testing.expectEqual(@as(usize, 3), full.all.len);
+    try std.testing.expectEqualStrings("ask", statusModes(registry, .ask).?.current);
+    try std.testing.expect(statusModes(.{ .default_mode_id = "surface" }, .auto) == null);
 }
 
 fn permissionModeForSnapshot(mode: anytype) types.PermissionMode {
