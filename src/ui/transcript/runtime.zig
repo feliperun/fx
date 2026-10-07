@@ -1723,6 +1723,53 @@ test "user prompt card commit caches the same source a frame would rebuild" {
     ) == null);
 }
 
+test "committed transcript source is not cached while released rows are still published" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = .{ .cols = 40, .rows = 12, .content_bottom = 8, .divider_top_row = 9, .input_row = 10, .divider_bottom_row = 11, .hint_row = 12 },
+        .has_committed_frame = true,
+        .detached_commit_alloc = alloc,
+        .committed_frame_layout = .{ .terminal_cols = 40, .terminal_rows = 12 },
+    };
+    defer runtime.deinit(alloc);
+    const id = try runtime.appendRawTranscriptEntryClassified(alloc, "RELEASED_ROW", .unknown_raw);
+    var flow = try source_preparation.prepareRetentionSource(&runtime, alloc);
+    defer flow.deinit(alloc);
+    var identity = try source_preparation.RetentionIdentity.capture(&runtime, alloc, &flow);
+    errdefer identity.deinit(alloc);
+    identity.publication_entries = try alloc.dupe(u32, &.{id});
+    identity.publication_release_floor = 1;
+    runtime.transcript_commit_state = .{ .recovering = .{
+        .flow = try alloc.dupe(u8, flow.bytes),
+        .retention_identity = identity,
+        .attempt_cols = 40,
+        .attempt_total_visual_rows = 1,
+        .materialized_visual_rows = 1,
+        .materialized_flow_len = flow.bytes.len,
+        .tracks_semantic_progress = true,
+        .presentation_valid = true,
+    } };
+    identity = .{};
+
+    for ([_]bool{ true, false }) |published| {
+        if (!published) {
+            const retention = &runtime.transcript_commit_state.recovering.retention_identity;
+            alloc.free(retention.publication_entries);
+            retention.publication_entries = &.{};
+        }
+        const previous_revision = runtime.full_transcript_content_revision;
+        runtime.full_transcript_content_revision += 1;
+        const committed = try source_preparation.prepareTranscriptSource(&runtime, alloc, null);
+        runtime.adoptCommittedTranscriptSource(alloc, committed, previous_revision);
+        const cached = runtime.compact_transcript_source_cache.find(
+            runtime.full_transcript_content_revision,
+            runtime.layout.cols,
+            true,
+        );
+        try std.testing.expectEqual(!published, cached != null);
+    }
+}
+
 test "compact transcript cache survives navigation and invalidates on content change" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{

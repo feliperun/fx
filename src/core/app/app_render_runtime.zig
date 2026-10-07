@@ -2664,17 +2664,31 @@ test "pending prompt at an occupied band bottom preserves the summary through ad
     try std.testing.expectEqualStrings(finished, quiet);
 }
 
-fn currentCompactSourceBytes(shell: *const transcript_runtime.TranscriptRuntime) ?[*]const u8 {
-    for (shell.compact_transcript_source_cache.entries) |entry| {
-        const cached = entry orelse continue;
-        if (cached.content_revision == shell.full_transcript_content_revision and
-            cached.cols == shell.layout.cols and
-            cached.has_committed_frame == shell.has_committed_frame)
-        {
-            return cached.source.bytes.ptr;
+fn currentCompactSource(shell: *transcript_runtime.TranscriptRuntime) ?*transcript_runtime.TranscriptPreparationSource {
+    for (&shell.compact_transcript_source_cache.entries) |*entry| {
+        if (entry.*) |*cached| {
+            if (cached.content_revision == shell.full_transcript_content_revision and
+                cached.cols == shell.layout.cols and
+                cached.has_committed_frame == shell.has_committed_frame)
+            {
+                return &cached.source;
+            }
         }
     }
     return null;
+}
+
+const compact_source_cache_capacity = @typeInfo(@FieldType(
+    @FieldType(transcript_runtime.TranscriptRuntime, "compact_transcript_source_cache"),
+    "entries",
+)).array.len;
+
+fn compactSourceCacheSlots(shell: *const transcript_runtime.TranscriptRuntime) [compact_source_cache_capacity]?[*]const u8 {
+    var slots: [compact_source_cache_capacity]?[*]const u8 = undefined;
+    for (shell.compact_transcript_source_cache.entries, &slots) |entry, *slot| {
+        slot.* = if (entry) |cached| cached.source.bytes.ptr else null;
+    }
+    return slots;
 }
 
 fn findGridRow(alloc: std.mem.Allocator, physical: *vt_emulator.Grid, needle: []const u8) !?u16 {
@@ -2743,10 +2757,15 @@ test "pending prompt on a full screen is visible before adoption and keeps its r
 
     app.submission.pending.?.phase = .adopted;
     _ = try app.shell.writeUserPromptCard(alloc, &app.metrics, .{ .text = app.submission.pending.?.draft.prompt }, true, &.{});
-    const seeded = currentCompactSourceBytes(&app.shell) orelse return error.CommittedSourceNotCached;
+    const seeded = currentCompactSource(&app.shell) orelse return error.CommittedSourceNotCached;
+    const slots_before = compactSourceCacheSlots(&app.shell);
+    // A cache hit refreshes the cursor from the shell, so clearing this
+    // column proves the frame read the commit's source instead of rebuilding.
+    const poisoned_col = std.math.maxInt(@TypeOf(seeded.preview.cursor_col));
+    seeded.preview.cursor_col = poisoned_col;
     _ = try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
-    // The frame that shows the card reused the commit's source.
-    try std.testing.expectEqual(seeded, currentCompactSourceBytes(&app.shell) orelse return error.CommittedSourceDropped);
+    try std.testing.expectEqual(slots_before, compactSourceCacheSlots(&app.shell));
+    try std.testing.expect(seeded.preview.cursor_col != poisoned_col);
     try std.testing.expectEqual(preview_row, (try findGridRow(alloc, &physical, prompt)) orelse return error.AdoptedCardMissing);
     const adopted = try rewritePublicationText(alloc, &physical, history.items);
     defer alloc.free(adopted);
